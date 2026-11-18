@@ -1,0 +1,25 @@
+# Build output
+app/
+bin/
+obj/
+*.exe
+*.pdb
+
+# Model weights: downloaded by the app on first run, never committed
+*.gguf
+*.gguf.partial
+models/
+
+# Native runtime bundled from the NeMo-Speech.cpp release
+*.dll
+*.lib
+*.exp
+
+# Local state
+settings.txt
+docs/*.local.png
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
