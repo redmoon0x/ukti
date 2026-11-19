@@ -1,18 +1,19 @@
 using System;
 using System.Drawing;
+using System.Collections.Generic;
 using System.Drawing.Drawing2D;
+using System.Windows.Forms;
 
 namespace Ukti
 {
-    // Hex's OpenCode dark palette and motion values, taken from
-    // HexTheme.swift (anomalyco/hex) so the app reads as the same product:
-    // one cool-neutral temperature, depth by opacity, no second accent hue.
+    // Neutral surfaces from Hex's current Rune settings UI. Keep the Windows
+    // implementation native and retain Ukti's own mark and existing controls.
     static class Theme
     {
-        public static readonly Color BgDeep = Color.FromArgb(0x0A, 0x0B, 0x0D);
-        public static readonly Color BgBase = Color.FromArgb(0x11, 0x13, 0x16);
-        public static readonly Color Layer01 = Color.FromArgb(0x17, 0x19, 0x1D);
-        public static readonly Color Layer02 = Color.FromArgb(0x20, 0x23, 0x29);
+        public static readonly Color BgDeep = Color.FromArgb(0x08, 0x08, 0x08);
+        public static readonly Color BgBase = Color.FromArgb(0x15, 0x15, 0x15);
+        public static readonly Color Layer01 = Color.FromArgb(0x1C, 0x1C, 0x1C);
+        public static readonly Color Layer02 = Color.FromArgb(0x2C, 0x2C, 0x2C);
 
         // Text is white at fixed opacities rather than separate greys, so it
         // composites correctly on every layer.
@@ -34,8 +35,43 @@ namespace Ukti
         public static readonly Color WarmPearl = Color.FromArgb(245, 240, 227);
         public static readonly Color AgentBlue = Color.FromArgb(199, 219, 247);
 
-        public const int CardRadius = 18;
+        public const int CardRadius = 12;
         public const int ControlRadius = 9;
+
+        // Native controls require opaque foregrounds; alpha text is only for GDI+.
+        public static readonly Color Ink = Blend(BgBase, Color.White, 0.94f);
+        public static readonly Color MutedInk = Blend(BgBase, Color.White, 0.64f);
+        public static readonly Color FaintInk = Blend(BgBase, Color.White, 0.44f);
+
+        public static void DrawSurface(Graphics g, Rectangle bounds, Color fill, int radius)
+        {
+            using (GraphicsPath path = RoundedRect(bounds, radius))
+            {
+                using (SolidBrush brush = new SolidBrush(fill)) g.FillPath(brush, path);
+                using (Pen pen = new Pen(BorderStrong)) g.DrawPath(pen, path);
+            }
+        }
+
+        public static void DrawText(Graphics g, string text, float size, Color color,
+                                    Rectangle bounds, bool bold)
+        {
+            using (Font font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular))
+                TextRenderer.DrawText(g, text, font, bounds, color,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix |
+                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        }
+
+        public static void DrawKey(Graphics g, string text, Rectangle bounds)
+        {
+            DrawSurface(g, bounds, Layer02, 6);
+            using (Pen p = new Pen(Alpha(Color.Black, 0.6f), 2))
+                g.DrawLine(p, bounds.Left + 5, bounds.Bottom - 2, bounds.Right - 5, bounds.Bottom - 2);
+            using (Font font = new Font("Segoe UI", 9f))
+                TextRenderer.DrawText(g, text, font, bounds, Ink,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        }
 
         public static Color Alpha(Color c, float a)
         {
@@ -87,8 +123,22 @@ namespace Ukti
             }
         }
 
-        // Draws the Ukti mark: the Kannada word ಉಕ್ತಿ, embedded as a luminance
-        // mask so it can be tinted to any colour without a second asset.
+        static Icon _appIcon;
+        public static Icon AppIcon
+        {
+            get
+            {
+                if (_appIcon == null)
+                {
+                    using (System.IO.Stream stream = typeof(Theme).Assembly.GetManifestResourceStream("ukti.ico"))
+                    using (Icon icon = new Icon(stream)) _appIcon = (Icon)icon.Clone();
+                }
+                return _appIcon;
+            }
+        }
+
+        // The supplied Kannada voice-recording artwork, with its black canvas
+        // removed and preserved as an antialiased alpha mark for every surface.
         public static void DrawMark(Graphics g, RectangleF bounds, Color color)
         {
             Bitmap glyph = MarkGlyph;
@@ -103,10 +153,32 @@ namespace Ukti
             float w = glyph.Width * scale;
             float x = bounds.Left + (bounds.Width - w) / 2f;
 
-            using (Bitmap tinted = Tint(glyph, color))
-                g.DrawImage(tinted, x, bounds.Top, w, side);
+            if (side <= 0) return;
+            int pixels = Math.Max(1, Math.Min(256, (int)Math.Ceiling(side)));
+            long key = ((long)color.ToArgb() << 32) | (uint)pixels;
+            Bitmap tinted;
+            lock (_markRenders)
+            {
+                if (!_markRenders.TryGetValue(key, out tinted))
+                {
+                    // Cache at the actual UI size rather than allocating a
+                    // 512px tinted bitmap on every animation frame.
+                    using (Bitmap scaled = new Bitmap(pixels, pixels))
+                    {
+                        using (Graphics draw = Graphics.FromImage(scaled))
+                        {
+                            draw.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            draw.DrawImage(glyph, new Rectangle(0, 0, pixels, pixels));
+                        }
+                        tinted = Tint(scaled, color);
+                    }
+                    _markRenders.Add(key, tinted);
+                }
+            }
+            g.DrawImage(tinted, x, bounds.Top, w, side);
         }
 
+        static readonly Dictionary<long, Bitmap> _markRenders = new Dictionary<long, Bitmap>();
         static Bitmap _markGlyph;
         static bool _markLoaded;
 

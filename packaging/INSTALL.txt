@@ -1,0 +1,66 @@
+UKTI - WINDOWS INSTALLER
+
+Requirements
+- Windows 10 or Windows 11, 64-bit x64.
+- .NET Framework 4.8 or newer (normally provided by Windows Update).
+- A compatible NVIDIA GPU and a current NVIDIA driver supporting the bundled
+  NeMo-Speech.cpp 0.3.0 CUDA runtime. Intel/AMD-only machines are not supported
+  by this build. Installing the full CUDA Toolkit is not required.
+- About 650 MB installed for the application/runtime, plus 700 MB-1.18 GB per model.
+- About 2 GB free setup space for downloading/extracting the runtime temporarily.
+- Internet for the web installer's runtime download (about 485 MiB), unless a
+  matching Ukti runtime is already available; then for the first model download.
+  Dictation is local afterward.
+
+Install
+1. Copy Ukti-Setup-1.0.0-win-x64.exe to the laptop and double-click it.
+2. If another Ukti copy is running, quit it from the system tray first.
+3. Follow the wizard. This small web installer downloads the NVIDIA runtime,
+   verifies its pinned SHA-256 checksum, and installs only the needed DLLs.
+   A matching existing Ukti runtime is reused instead. Failed/interrupted
+   downloads can resume on retry; unverified files are never installed.
+   Installation is per-user and does not require admin rights.
+   The default application location is %LOCALAPPDATA%\Programs\Ukti.
+4. Open Ukti from the Start menu. Choose and download a speech model.
+5. Select the laptop's microphone in Settings and click Save changes.
+6. Focus a text field. Hold Ctrl+Space, wait for Listening, speak, then release.
+
+No model is included in this installer. The small setup EXE does not embed the
+large CUDA DLLs either; downloading them during setup keeps the EXE small, not
+the total installation size. An optional -offline installer build embeds the
+runtime (but still no model).
+
+If the runtime is already in another Ukti folder, you can avoid downloading it:
+  Ukti-Setup-1.0.0-win-x64.exe /RUNTIME_DIR="D:\path\to\Ukti\app"
+The DLL checksums must match; just having an NVIDIA driver or CUDA Toolkit
+installed does not provide the complete NeMo speech runtime.
+
+Models download to %LOCALAPPDATA%\Ukti\models, usually:
+  C:\Users\<username>\AppData\Local\Ukti\models
+Preferences are saved in %LOCALAPPDATA%\Ukti\settings.txt.
+Your downloads are reused on later launches and retained when updating Ukti.
+No microphone choice, recordings, logs, or settings from the build machine are
+included in the installer.
+
+Memory
+The speech model runs in a separate local process. After the selected idle
+interval (five minutes by default), that process exits and releases its native
+RAM/GPU allocations. The small tray application remains available to wake it.
+
+Uninstall
+Quit Ukti, then use Windows Settings > Apps > Installed apps > Ukti > Uninstall,
+or choose Uninstall Ukti in the Start menu. Downloaded models and preferences
+are kept for reinstalling. To remove those too, delete %LOCALAPPDATA%\Ukti after
+uninstalling. Uninstallation does not recursively delete unrelated files from
+a custom installation directory.
+
+Unsigned build
+This installer is not code-signed. Windows SmartScreen may display an unknown
+publisher warning. Verify that the file came from the build you trust and, if
+needed, compare its SHA-256 hash with the supplied .sha256 file. No security
+software or Windows protections need to be disabled.
+
+Licenses
+Ukti is MIT-licensed. Bundled runtime libraries have their own licenses in the
+installed licenses folder, including NVIDIA CUDA redistribution terms. Speech
+models are downloaded separately under the license linked in the model chooser.

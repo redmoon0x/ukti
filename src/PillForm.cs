@@ -34,10 +34,11 @@ namespace Ukti
 
         // Hex's capsule proportions, scaled down and simplified for a small
         // always-on-top indicator at the top of the screen.
-        const int PlateHeight = 34;
-        const int PadX = 12;
+        const int PlateHeight = 40;
+        const int PadX = 14;
         const int DotPlateWidth = 124;
-        const int WorkWidth = 132;
+        const int BrandSpace = 32;
+        const int WorkWidth = 148;
         const int TopMargin = 8;
 
         // The window is the capsule plus room for its soft shadow.
@@ -115,6 +116,7 @@ namespace Ukti
         readonly Timer _timer;
         readonly DotScope _scope = new DotScope();
         readonly Stopwatch _clock = new Stopwatch();
+        readonly Stopwatch _appearance = new Stopwatch();
 
         int _mode;                 // 0 hidden, 1 listening, 2 working
         IntPtr _anchorWindow = IntPtr.Zero;
@@ -127,14 +129,16 @@ namespace Ukti
         {
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
+            SetStyle(ControlStyles.Selectable, false);
             StartPosition = FormStartPosition.Manual;
-            TopMost = true;
+            // Do not set Form.TopMost: WinForms focuses a topmost form after
+            // showing it, even with ShowWithoutActivation. Use native z-order.
             BackColor = Color.Black;
             SetStyle(ControlStyles.Opaque, true);
             SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor, true);
 
-            SetCapsuleSize(DotPlateWidth + PadX * 2, PlateHeight);
+            SetCapsuleSize(DotPlateWidth + PadX * 2 + BrandSpace, PlateHeight);
 
             _timer = new Timer();
             _timer.Interval = 16;
@@ -154,7 +158,8 @@ namespace Ukti
                 CreateParams cp = base.CreateParams;
                 // No CS_DROPSHADOW: it shadows the window rectangle rather than
                 // the capsule, which would bring back the box being removed.
-                cp.ExStyle |= WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+                cp.ExStyle |= WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                              WS_EX_LAYERED | WS_EX_TRANSPARENT;
                 return cp;
             }
         }
@@ -175,7 +180,7 @@ namespace Ukti
             _caption = "";
             _scope.Restart();
             _clock.Restart();
-            SetCapsuleSize(DotPlateWidth + PadX * 2, PlateHeight);
+            SetCapsuleSize(DotPlateWidth + PadX * 2 + BrandSpace, PlateHeight);
             Present();
         }
 
@@ -183,8 +188,13 @@ namespace Ukti
         {
             _anchorWindow = anchor;
             _mode = 2;
-            _caption = caption ?? "Processing";
-            SetCapsuleSize(WorkWidth, PlateHeight);
+            _caption = string.IsNullOrEmpty(caption) ? "Processing" : caption;
+            if (!_clock.IsRunning) _clock.Start();
+            using (Font font = new Font("Segoe UI", 9.5f, FontStyle.Bold))
+            {
+                int textWidth = TextRenderer.MeasureText(_caption + "\u2026", font).Width;
+                SetCapsuleSize(Math.Max(WorkWidth, textWidth + PadX * 2 + 25) + BrandSpace, PlateHeight);
+            }
             Present();
         }
 
@@ -198,7 +208,9 @@ namespace Ukti
         void Present()
         {
             PositionNearAnchor();
-            if (!Visible) Show();
+            if (!Visible) { _appearance.Restart(); Show(); }
+            SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
             _timer.Start();
             Render();
         }
@@ -246,37 +258,36 @@ namespace Ukti
         {
             if (!IsHandleCreated || _mode == 0) return;
 
-            using (Bitmap bmp = new Bitmap(Width, Height, PixelFormat.Format32bppArgb))
+            using (Bitmap bmp = RenderFrame()) Composite(bmp);
+        }
+
+        // The same alpha frame drives the compositor and UI snapshot tests;
+        // previews never need to capture other applications on the desktop.
+        internal Bitmap RenderFrame()
+        {
+            Bitmap bmp = new Bitmap(Width, Height, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bmp))
             {
-                using (Graphics g = Graphics.FromImage(bmp))
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                g.Clear(Color.Transparent);
+                Rectangle capsule = new Rectangle(ShadowMargin, ShadowMargin, _capsule.Width, _capsule.Height);
+                DrawShadow(g, capsule);
+                using (GraphicsPath path = Theme.RoundedRect(capsule, _capsule.Height / 2))
                 {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-                    g.Clear(Color.Transparent);
-
-                    Rectangle capsule = new Rectangle(
-                        ShadowMargin, ShadowMargin, _capsule.Width, _capsule.Height);
-
-                    DrawShadow(g, capsule);
-
-                    using (GraphicsPath path = Theme.RoundedRect(capsule, _capsule.Height / 2))
-                    {
-                        using (SolidBrush fill = new SolidBrush(Theme.BgDeep))
-                            g.FillPath(fill, path);
-
-                        using (Pen border = new Pen(Theme.BorderStrong, 1f))
-                            g.DrawPath(border, path);
-
-                        GraphicsState state = g.Save();
-                        g.SetClip(path, CombineMode.Intersect);
-                        if (_mode == 1) DrawDotField(g, capsule);
-                        else DrawWorking(g, capsule);
-                        g.Restore(state);
-                    }
+                    using (SolidBrush fill = new SolidBrush(Theme.BgDeep)) g.FillPath(fill, path);
+                    using (Pen border = new Pen(Theme.BorderStrong, 1f)) g.DrawPath(border, path);
+                    GraphicsState state = g.Save();
+                    g.SetClip(path, CombineMode.Intersect);
+                    Theme.DrawMark(g, new RectangleF(capsule.Left + 8, capsule.Top + 8, 24, 24), Theme.Ink);
+                    Rectangle content = new Rectangle(capsule.Left + BrandSpace, capsule.Top,
+                        capsule.Width - BrandSpace, capsule.Height);
+                    if (_mode == 1) DrawDotField(g, content);
+                    else DrawWorking(g, content);
+                    g.Restore(state);
                 }
-
-                Composite(bmp);
             }
+            return bmp;
         }
 
         // A soft shadow drawn as concentric translucent capsules. Every ring
@@ -322,7 +333,7 @@ namespace Ukti
                 BLENDFUNCTION blend = new BLENDFUNCTION();
                 blend.BlendOp = AC_SRC_OVER;
                 blend.BlendFlags = 0;
-                blend.SourceConstantAlpha = 255;
+                blend.SourceConstantAlpha = (byte)(255 * Math.Min(1.0, _appearance.Elapsed.TotalMilliseconds / 120.0));
                 blend.AlphaFormat = AC_SRC_ALPHA;
 
                 UpdateLayeredWindow(Handle, screenDc, ref dst, ref size, memDc,
@@ -399,6 +410,12 @@ namespace Ukti
             }
         }
 
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _timer.Dispose();
+            base.Dispose(disposing);
+        }
+
         void DrawWorking(Graphics g, Rectangle capsule)
         {
             float elapsed = (float)_clock.Elapsed.TotalSeconds;
@@ -407,22 +424,23 @@ namespace Ukti
             float cy = capsule.Top + capsule.Height / 2f;
             float radius = 7f;
 
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 8; i++)
             {
-                float phase = elapsed * 5f + i * 0.55f;
-                float pulse = 0.35f + 0.65f * (float)((Math.Sin(phase) + 1) / 2);
-                double angle = i * Math.PI / 3;
+                float phase = (elapsed * 1.4f - i / 8f) % 1f;
+                if (phase < 0) phase += 1f;
+                float pulse = 1f - phase;
+                double angle = i * Math.PI / 4;
                 float x = cx + (float)Math.Cos(angle) * radius;
                 float y = cy + (float)Math.Sin(angle) * radius;
-                int alpha = (int)(60 + 175 * pulse);
-                using (SolidBrush b = new SolidBrush(Color.FromArgb(alpha, 205, 215, 235)))
+                int alpha = (int)(45 + 210 * pulse);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(alpha, 245, 245, 245)))
                     g.FillEllipse(b, x - 1.7f, y - 1.7f, 3.4f, 3.4f);
             }
 
             using (Font f = new Font("Segoe UI", 9.5f, FontStyle.Bold))
             using (SolidBrush b = new SolidBrush(TextBase))
             {
-                string text = _caption + "...";
+                string text = _caption + "\u2026";
                 float textX = cx + radius + 10f;
                 SizeF size = g.MeasureString(text, f);
                 g.DrawString(text, f, b, textX, cy - size.Height / 2f - 1f);

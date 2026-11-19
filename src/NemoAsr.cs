@@ -17,17 +17,18 @@ namespace Ukti
 
     public sealed class NemoStream : IDisposable
     {
-        IntPtr _handle;
+        NemoStreamHandle _handle;
         bool _closed;
 
-        internal NemoStream(IntPtr handle) { _handle = handle; }
+        internal NemoStream(NemoStreamHandle handle) { _handle = handle; }
 
         public void Push(float[] samples, int sampleRate)
         {
             if (_closed) return;
             if (samples == null || samples.Length == 0) return;
+            IntPtr stream = _handle.DangerousGetHandle();
             int status = NemoAsr.nemo_speech_asr_stream_push_f32(
-                _handle, samples, (UIntPtr)(uint)samples.Length, sampleRate);
+                stream, samples, (UIntPtr)(uint)samples.Length, sampleRate);
             if (status != 0)
             {
                 throw new InvalidOperationException("Audio push failed: " + NemoAsr.Utf8(NemoAsr.nemo_speech_asr_last_error()));
@@ -40,7 +41,7 @@ namespace Ukti
             isFinal = false;
             if (_closed) return null;
             IntPtr result;
-            int status = NemoAsr.nemo_speech_asr_stream_next(_handle, out result);
+            int status = NemoAsr.nemo_speech_asr_stream_next(_handle.DangerousGetHandle(), out result);
             if (status != 0)
             {
                 throw new InvalidOperationException("Stream decode failed: " + NemoAsr.Utf8(NemoAsr.nemo_speech_asr_last_error()));
@@ -61,20 +62,20 @@ namespace Ukti
 
         public void Finish()
         {
-            if (_closed) return;
-            NemoAsr.nemo_speech_asr_stream_finish(_handle);
+            if (_closed || _handle.IsInvalid) return;
+            NemoAsr.nemo_speech_asr_stream_finish(_handle.DangerousGetHandle());
         }
 
         public void Dispose()
         {
             if (_closed) return;
             _closed = true;
-            NemoAsr.nemo_speech_asr_stream_close(_handle);
-            _handle = IntPtr.Zero;
+            if (_handle != null) _handle.Dispose();
+            _handle = null;
         }
     }
 
-    public sealed class NemoAsr : IDisposable
+    public sealed class NemoAsr : IDisposable, IAsrEngine
     {
         const string Dll = "nemo_speech_asr_c.dll";
 
@@ -153,9 +154,7 @@ namespace Ukti
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         static extern int nemo_speech_asr_create(IntPtr cfg, out IntPtr recognizer);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-        static extern void nemo_speech_asr_destroy(IntPtr recognizer);
-
+        // nemo_speech_asr_destroy is called by NemoAsrHandle.ReleaseHandle.
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         static extern int nemo_speech_asr_recognize_f32(
             IntPtr recognizer, IntPtr options, [In] float[] samples, UIntPtr nSamples,
@@ -197,8 +196,9 @@ namespace Ukti
         [return: MarshalAs(UnmanagedType.I1)]
         internal static extern bool nemo_speech_asr_result_is_final(IntPtr result);
 
-        IntPtr _recognizer = IntPtr.Zero;
-        IntPtr _optionsBuffer = IntPtr.Zero;
+        NemoAsrHandle _recognizer;   // tests reflect the handle; field name preserved
+        HGlobalHandle _optionsBuffer;
+        HGlobalHandle _languageBuffer;
         bool _disposed;
 
         public string Version { get { return Utf8(nemo_speech_asr_version()); } }
@@ -220,30 +220,29 @@ namespace Ukti
             return string.IsNullOrEmpty(e) ? "(no detail)" : e;
         }
 
-        public static NemoAsr Create(string modelPath, int gpuIndex, float chunkSeconds, int rnntRightContext)
+        public static NemoAsr Create(string modelPath, int gpuIndex, float chunkSeconds, int rnntRightContext, string languageCode = "en-US")
         {
             NemoAsr asr = new NemoAsr();
-            IntPtr backendMem = IntPtr.Zero;
-            IntPtr modelMem = IntPtr.Zero;
-            IntPtr streamingMem = IntPtr.Zero;
-            IntPtr batchingMem = IntPtr.Zero;
-            IntPtr cfgMem = IntPtr.Zero;
-            IntPtr pathMem = IntPtr.Zero;
+            // SafeHandle allocation wrappers: every AllocHGlobal is owned by a
+            // finalizable handle, so no exception path can leak native memory.
+            HGlobalHandle backendMem, modelMem, streamingMem, batchingMem, cfgMem, pathMem;
+            backendMem = modelMem = streamingMem = batchingMem = cfgMem = pathMem = null;
             try
             {
                 BackendConfig backend = new BackendConfig();
                 backend.size = (IntPtr)Marshal.SizeOf(typeof(BackendConfig));
                 backend.gpu = gpuIndex;
-                backendMem = Marshal.AllocHGlobal(backend.size);
-                Marshal.StructureToPtr(backend, backendMem, false);
+                backendMem = new HGlobalHandle(Marshal.AllocHGlobal(backend.size));
+                Marshal.StructureToPtr(backend, backendMem.DangerousGetHandle(), false);
 
                 ModelConfig model = new ModelConfig();
                 model.size = (IntPtr)Marshal.SizeOf(typeof(ModelConfig));
+
                 pathMem = Utf8Z(modelPath);
-                model.path = pathMem;
+                model.path = pathMem.DangerousGetHandle();
                 model.name = IntPtr.Zero;
-                modelMem = Marshal.AllocHGlobal(model.size);
-                Marshal.StructureToPtr(model, modelMem, false);
+                modelMem = new HGlobalHandle(Marshal.AllocHGlobal(model.size));
+                Marshal.StructureToPtr(model, modelMem.DangerousGetHandle(), false);
 
                 StreamingConfig streaming = new StreamingConfig();
                 streaming.size = (IntPtr)Marshal.SizeOf(typeof(StreamingConfig));
@@ -251,14 +250,14 @@ namespace Ukti
                 streaming.ctc_left_padding = 1.92f;
                 streaming.ctc_right_padding = 1.92f;
                 streaming.rnnt_right_context = rnntRightContext;
-                streamingMem = Marshal.AllocHGlobal(streaming.size);
-                Marshal.StructureToPtr(streaming, streamingMem, false);
+                streamingMem = new HGlobalHandle(Marshal.AllocHGlobal(streaming.size));
+                Marshal.StructureToPtr(streaming, streamingMem.DangerousGetHandle(), false);
 
                 RecognizerConfig cfg = new RecognizerConfig();
                 cfg.size = (IntPtr)Marshal.SizeOf(typeof(RecognizerConfig));
-                cfg.backend = backendMem;
-                cfg.model = modelMem;
-                cfg.streaming = streamingMem;
+                cfg.backend = backendMem.DangerousGetHandle();
+                cfg.model = modelMem.DangerousGetHandle();
+                cfg.streaming = streamingMem.DangerousGetHandle();
 
                 // Dynamic batching exists to combine concurrent requests on one
                 // recogniser. This app decodes one utterance at a time, so it
@@ -272,50 +271,56 @@ namespace Ukti
                 batching.max_queue_delay_us = 0;
                 batching.max_queue_depth = 1;
                 batching.state_arena_slots = 1;
-                batchingMem = Marshal.AllocHGlobal(batching.size);
-                Marshal.StructureToPtr(batching, batchingMem, false);
-                cfg.batching = batchingMem;
+                batchingMem = new HGlobalHandle(Marshal.AllocHGlobal(batching.size));
+                Marshal.StructureToPtr(batching, batchingMem.DangerousGetHandle(), false);
+                cfg.batching = batchingMem.DangerousGetHandle();
 
-                cfgMem = Marshal.AllocHGlobal(cfg.size);
-                Marshal.StructureToPtr(cfg, cfgMem, false);
+                cfgMem = new HGlobalHandle(Marshal.AllocHGlobal(cfg.size));
+                Marshal.StructureToPtr(cfg, cfgMem.DangerousGetHandle(), false);
 
                 IntPtr rec;
-                int status = nemo_speech_asr_create(cfgMem, out rec);
+                int status = nemo_speech_asr_create(cfgMem.DangerousGetHandle(), out rec);
                 if (status != 0 || rec == IntPtr.Zero)
                 {
                     throw new InvalidOperationException(
                         "ASR initialisation failed (status " + status + "): " + LastError());
                 }
-                asr._recognizer = rec;
-                asr._optionsBuffer = BuildOptions();
+                asr._recognizer = new NemoAsrHandle(rec);
+                asr._optionsBuffer = asr.BuildOptions(languageCode);
                 return asr;
+            }
+            catch
+            {
+                asr.Dispose();
+                throw;
             }
             finally
             {
-                if (cfgMem != IntPtr.Zero) Marshal.FreeHGlobal(cfgMem);
-                if (batchingMem != IntPtr.Zero) Marshal.FreeHGlobal(batchingMem);
-                if (streamingMem != IntPtr.Zero) Marshal.FreeHGlobal(streamingMem);
-                if (modelMem != IntPtr.Zero) Marshal.FreeHGlobal(modelMem);
-                if (backendMem != IntPtr.Zero) Marshal.FreeHGlobal(backendMem);
-                if (pathMem != IntPtr.Zero) Marshal.FreeHGlobal(pathMem);
+                if (cfgMem != null) cfgMem.Dispose();
+                if (batchingMem != null) batchingMem.Dispose();
+                if (streamingMem != null) streamingMem.Dispose();
+                if (modelMem != null) modelMem.Dispose();
+                if (backendMem != null) backendMem.Dispose();
+                if (pathMem != null) pathMem.Dispose();
             }
         }
 
-        static IntPtr Utf8Z(string s)
+        static HGlobalHandle Utf8Z(string s)
         {
             byte[] bytes = Encoding.UTF8.GetBytes(s);
-            IntPtr mem = Marshal.AllocHGlobal(bytes.Length + 1);
-            Marshal.Copy(bytes, 0, mem, bytes.Length);
-            Marshal.WriteByte(mem, bytes.Length, 0);
+            HGlobalHandle mem = new HGlobalHandle(Marshal.AllocHGlobal(bytes.Length + 1));
+            Marshal.Copy(bytes, 0, mem.DangerousGetHandle(), bytes.Length);
+            Marshal.WriteByte(mem.DangerousGetHandle(), bytes.Length, 0);
             return mem;
         }
 
-        static IntPtr BuildOptions()
+        HGlobalHandle BuildOptions(string languageCode)
         {
             RecognitionOptions opt = new RecognitionOptions();
             opt.size = (IntPtr)Marshal.SizeOf(typeof(RecognitionOptions));
             opt.request_id = IntPtr.Zero;
-            opt.language_code = Utf8Z("en-US");
+
+            _languageBuffer = string.IsNullOrEmpty(languageCode) ? null : Utf8Z(languageCode);
             opt.interim_results = false;
             opt.enable_word_time_offsets = false;
             opt.enable_automatic_punctuation = true;
@@ -328,8 +333,8 @@ namespace Ukti
             opt.enable_speaker_diarization = false;
             opt.max_speaker_count = 0;
 
-            IntPtr mem = Marshal.AllocHGlobal(opt.size);
-            Marshal.StructureToPtr(opt, mem, false);
+            HGlobalHandle mem = new HGlobalHandle(Marshal.AllocHGlobal(opt.size));
+            Marshal.StructureToPtr(opt, mem.DangerousGetHandle(), false);
             return mem;
         }
 
@@ -337,11 +342,12 @@ namespace Ukti
         {
             if (samples == null) throw new ArgumentNullException("samples");
             if (samples.Length == 0) return string.Empty;
-            if (_recognizer == IntPtr.Zero) throw new ObjectDisposedException("NemoAsr");
+            if (_recognizer == null || _recognizer.IsInvalid) throw new ObjectDisposedException("NemoAsr");
 
             IntPtr result;
             int status = nemo_speech_asr_recognize_f32(
-                _recognizer, _optionsBuffer, samples, (UIntPtr)(uint)samples.Length, sampleRate, out result);
+                _recognizer.DangerousGetHandle(), _optionsBuffer.DangerousGetHandle(), samples,
+                (UIntPtr)(uint)samples.Length, sampleRate, out result);
             if (status != 0)
             {
                 throw new InvalidOperationException(
@@ -362,31 +368,25 @@ namespace Ukti
 
         public NemoStream StartStream()
         {
-            if (_recognizer == IntPtr.Zero) throw new ObjectDisposedException("NemoAsr");
+            if (_recognizer == null || _recognizer.IsInvalid) throw new ObjectDisposedException("NemoAsr");
             IntPtr stream;
-            int status = nemo_speech_asr_streaming_recognize(_recognizer, _optionsBuffer, out stream);
+            int status = nemo_speech_asr_streaming_recognize(
+                _recognizer.DangerousGetHandle(), _optionsBuffer.DangerousGetHandle(), out stream);
             if (status != 0 || stream == IntPtr.Zero)
             {
                 throw new InvalidOperationException(
                     "Could not start audio stream (status " + status + "): " + LastError());
             }
-            return new NemoStream(stream);
+            return new NemoStream(new NemoStreamHandle(stream));
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            if (_recognizer != IntPtr.Zero)
-            {
-                nemo_speech_asr_destroy(_recognizer);
-                _recognizer = IntPtr.Zero;
-            }
-            if (_optionsBuffer != IntPtr.Zero)
-            {
-                Marshal.FreeHGlobal(_optionsBuffer);
-                _optionsBuffer = IntPtr.Zero;
-            }
+            if (_recognizer != null) { _recognizer.Dispose(); _recognizer = null; }
+            if (_optionsBuffer != null) { _optionsBuffer.Dispose(); _optionsBuffer = null; }
+            if (_languageBuffer != null) { _languageBuffer.Dispose(); _languageBuffer = null; }
         }
     }
 }

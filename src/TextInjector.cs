@@ -19,8 +19,38 @@ namespace Ukti
         const ushort VK_CONTROL = 0x11;
         const ushort VK_V = 0x56;
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct INPUT
+        {
+            public uint type;
+            public MOUSEKEYBDHARDWAREINPUT data;
+        }
+        [StructLayout(LayoutKind.Explicit)]
+        struct MOUSEKEYBDHARDWAREINPUT
+        {
+            [FieldOffset(0)] public KEYBDINPUT ki;
+            // INPUT's union must include its largest native member even when
+            // sending only keyboard events: sizeof(INPUT) is 40 on x64, not 32.
+            [FieldOffset(0)] public MOUSEINPUT mi;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct MOUSEINPUT
+        {
+            public int dx, dy;
+            public uint mouseData, dwFlags, time;
+            public IntPtr dwExtraInfo;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
         [DllImport("user32.dll", SetLastError = true)]
-        static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+        static extern uint SendInput(uint count, INPUT[] inputs, int size);
 
         [DllImport("user32.dll")]
         static extern IntPtr GetForegroundWindow();
@@ -72,6 +102,14 @@ namespace Ukti
         public static IntPtr CurrentForegroundWindow()
         {
             return GetForegroundWindow();
+        }
+
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+        internal static bool ModifiersReleased()
+        {
+            foreach (int key in new int[] { 0x10, 0x11, 0x12, 0x5B, 0x5C })
+                if (GetAsyncKeyState(key) < 0) return false;
+            return true;
         }
 
         static bool OpenClipboardRetry(int attempts)
@@ -134,15 +172,24 @@ namespace Ukti
             finally { CloseClipboard(); }
         }
 
-        static void SendCtrlV()
+        static bool SendCtrlV()
         {
-            keybd_event((byte)VK_CONTROL, 0, 0, UIntPtr.Zero);
-            Thread.Sleep(8);
-            keybd_event((byte)VK_V, 0, 0, UIntPtr.Zero);
-            Thread.Sleep(12);
-            keybd_event((byte)VK_V, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
-            Thread.Sleep(8);
-            keybd_event((byte)VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            INPUT[] inputs = new INPUT[4];
+            inputs[0].type = INPUT_KEYBOARD;
+            inputs[0].data.ki.wVk = VK_CONTROL;
+            inputs[1].type = INPUT_KEYBOARD;
+            inputs[1].data.ki.wVk = VK_V;
+            inputs[2].type = INPUT_KEYBOARD;
+            inputs[2].data.ki.wVk = VK_V;
+            inputs[2].data.ki.dwFlags = KEYEVENTF_KEYUP;
+            inputs[3].type = INPUT_KEYBOARD;
+            inputs[3].data.ki.wVk = VK_CONTROL;
+            inputs[3].data.ki.dwFlags = KEYEVENTF_KEYUP;
+            uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+            if (sent == inputs.Length) return true;
+            int error = Marshal.GetLastWin32Error();
+            TrayApp.Log("SendInput dispatched " + sent + "/" + inputs.Length + " events; Win32 error=" + error + ".");
+            return false;
         }
 
         // Pastes text. Returns null if the paste was dispatched, or a
@@ -162,21 +209,24 @@ namespace Ukti
             IntPtr now = GetForegroundWindow();
             if (targetWindow != IntPtr.Zero && now != targetWindow)
             {
-                return "The active window changed, so the text was left on the clipboard.";
+                return WriteClipboardText(text) ? "The active window changed. Your text was copied; paste it with Ctrl+V." :
+                    "The active window changed and the clipboard is unavailable. Use Copy last transcript from the tray to try again.";
             }
             if (now != IntPtr.Zero && !IsWindow(now))
             {
-                return "The target window closed, so the text was left on the clipboard.";
+                return WriteClipboardText(text) ? "The target window closed. Your text was copied; paste it with Ctrl+V." :
+                    "The target window closed and the clipboard is unavailable. Use Copy last transcript from the tray to try again.";
             }
 
             string previous = ReadClipboardText();
 
             if (!WriteClipboardText(text))
             {
-                return "Could not access the clipboard.";
+                return "Could not access the clipboard. Use Copy last transcript from the tray to try again.";
             }
 
-            SendCtrlV();
+            if (!SendCtrlV())
+                return "Windows blocked automatic paste. Your transcript is on the clipboard; paste it with Ctrl+V in the target app.";
 
             if (previous != null)
             {

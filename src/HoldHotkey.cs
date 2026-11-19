@@ -1,181 +1,134 @@
 using System;
-using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace Ukti
 {
-    // Hold-to-talk shortcut via a low-level keyboard hook (WH_KEYBOARD_LL).
-    //
-    // RegisterHotKey cannot express this interaction: it only reports the press,
-    // so the app could never learn that the user let go. The hook lets us mirror
-    // real key state, and it is passive - it observes and never swallows a key,
-    // so the shortcut cannot break normal typing anywhere else in Windows.
+    // Hold/release chord detector. Key events come from Raw Input (see
+    // RawInputKeyboard), not a WH_KEYBOARD_LL hook: Raw Input with INPUTSINK
+    // works behind any window and cannot be silently removed for exceeding
+    // LowLevelHooksTimeout. HandleKey remains the pure state machine so the
+    // chord rules are unit-testable without a system-wide input source.
     public sealed class HoldHotkey : IDisposable
     {
-        const int WH_KEYBOARD_LL = 13;
-        const int WM_KEYDOWN = 0x0100;
-        const int WM_KEYUP = 0x0101;
-        const int WM_SYSKEYDOWN = 0x0104;
-        const int WM_SYSKEYUP = 0x0105;
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
 
-        const int VK_CONTROL = 0x11;
-        const int VK_LCONTROL = 0xA2;
-        const int VK_RCONTROL = 0xA3;
-        const int VK_SPACE = 0x20;
-        const int VK_ESCAPE = 0x1B;
-        const int VK_MENU = 0x12;
+        readonly bool[] _down = new bool[256];
+        Shortcut _shortcut = Shortcut.Default;
+        RawInputKeyboard _rawInput;
+        bool _enabled, _armed;
+        int _consumedKey = -1;
 
-        [StructLayout(LayoutKind.Sequential)]
-        struct KBDLLHOOKSTRUCT
+        public event MethodInvoker Pressed, Released, Cancelled;
+        public bool IsHooked { get { return _rawInput != null; } }
+        public bool Enabled
         {
-            public uint vkCode;
-            public uint scanCode;
-            public uint flags;
-            public uint time;
-            public IntPtr dwExtraInfo;
+            get { return _enabled; }
+            set
+            {
+                _enabled = value;
+                if (!value && _armed) { _armed = false; Raise(Cancelled); }
+            }
         }
-
-        delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint threadId);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-        [DllImport("user32.dll")]
-        static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-        static extern IntPtr GetModuleHandle(string name);
-
-        [DllImport("user32.dll")]
-        static extern short GetAsyncKeyState(int vk);
-
-        readonly HookProc _proc;             // held so the GC cannot collect it
-        IntPtr _hook = IntPtr.Zero;
-        bool _armed;                         // Ctrl+Space is down and dictation started
-        bool _ctrlDown;
-        bool _spaceConsumed;
-
-        public event MethodInvoker Pressed;
-        public event MethodInvoker Released;
-        public event MethodInvoker Cancelled;
-
-        public bool IsHooked { get { return _hook != IntPtr.Zero; } }
-
-        public HoldHotkey()
+        public HoldHotkey() { }
+        internal void Configure(Shortcut shortcut)
         {
-            _proc = OnKey;
+            if (shortcut == null) throw new ArgumentNullException("shortcut");
+            if (_armed) { _armed = false; Raise(Cancelled); }
+            _shortcut = shortcut;
         }
-
-        public bool Install()
+        // Installs a Raw Input sink on the hidden dispatcher window's handle.
+        public bool Install(IntPtr windowHandle)
         {
-            if (_hook != IntPtr.Zero) return true;
-            _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
-            return _hook != IntPtr.Zero;
+            if (IsHooked) return true;
+            if (windowHandle == IntPtr.Zero) return false;
+            for (int i = 0; i < _down.Length; i++) _down[i] = GetAsyncKeyState(i) < 0;
+            RawInputKeyboard input = new RawInputKeyboard(windowHandle);
+            if (!input.Register()) { input.Dispose(); return false; }
+            _rawInput = input;
+            AppLogger.Info("raw input registered on hwnd=" + windowHandle);
+            return true;
         }
+        // Legacy overload: callers without a window handle cannot use Raw Input.
+        public bool Install() { return Install(GetFakeWindow()); }
+        static IntPtr GetFakeWindow()
+        {
+            // Reserved for tests that call Install() without a dispatcher; a
+            // real window is required for input, so report failure cleanly.
+            return IntPtr.Zero;
+        }
+        // Called from the dispatcher window's WndProc. Returns true if handled.
+        internal bool HandleRawInput(IntPtr lParam)
+        {
+            if (_rawInput == null) return false;
+            ushort vk; bool down;
+            if (!_rawInput.TryRead(lParam, out vk, out down)) return false;
 
+            return HandleKey(vk, down);
+        }
         public void Dispose()
         {
-            if (_hook != IntPtr.Zero)
-            {
-                UnhookWindowsHookEx(_hook);
-                _hook = IntPtr.Zero;
-            }
+            _enabled = _armed = false;
+            _consumedKey = -1;
+            Array.Clear(_down, 0, _down.Length);
+            if (_rawInput != null) { _rawInput.Dispose(); _rawInput = null; }
         }
-
-        static bool IsCtrl(int vk)
+        bool Any(Keys a, Keys left, Keys right) { return _down[(int)a] || _down[(int)left] || _down[(int)right]; }
+        Keys CurrentModifiers()
         {
-            return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL;
+            Keys result = Keys.None;
+            if (Any(Keys.ControlKey, Keys.LControlKey, Keys.RControlKey)) result |= Keys.Control;
+            if (Any(Keys.Menu, Keys.LMenu, Keys.RMenu)) result |= Keys.Alt;
+            if (Any(Keys.ShiftKey, Keys.LShiftKey, Keys.RShiftKey)) result |= Keys.Shift;
+            return result;
         }
-
-        static bool CtrlPhysicallyDown()
+        // Pure key-state entry point, exercised without installing a system input source.
+        internal bool HandleKey(int vk, bool down)
         {
-            return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-                   (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
-        }
-
-        IntPtr OnKey(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode < 0)
-                return CallNextHookEx(_hook, nCode, wParam, lParam);
-
-            int msg = wParam.ToInt32();
-            KBDLLHOOKSTRUCT data = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(
-                lParam, typeof(KBDLLHOOKSTRUCT));
-            int vk = (int)data.vkCode;
-
-            bool isDown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-            bool isUp = msg == WM_KEYUP || msg == WM_SYSKEYUP;
-
-            if (isDown)
+            if (vk < 0 || vk >= _down.Length) return false;
+            bool repeat = _down[vk];
+            _down[vk] = down;
+            // Installation snapshots both generic and sided modifiers; Raw
+            // Input normalizes events to sided keys. Keep the generic state in
+            // sync so a modifier held during installation cannot remain stuck.
+            if (down)
             {
-                if (IsCtrl(vk))
-                {
-                    _ctrlDown = true;
-                }
-                else if (vk == VK_SPACE)
-                {
-                    // Guard against / repeat: only the first transition starts.
-                    if (_ctrlDown || CtrlPhysicallyDown())
-                    {
-                        _spaceConsumed = true;
-                        if (!_armed)
-                        {
-                            _armed = true;
-                            Raise(Pressed);
-                        }
-                        // Swallow the key so the target app never sees a space
-                        // typed. Returning non-zero stops further processing.
-                        return (IntPtr)1;
-                    }
-                }
-                else if (vk == VK_ESCAPE && _armed)
-                {
-                    _armed = false;
-                    _spaceConsumed = false;
-                    Raise(Cancelled);
-                }
+                if (vk == (int)Keys.LControlKey || vk == (int)Keys.RControlKey) _down[(int)Keys.ControlKey] = true;
+                if (vk == (int)Keys.LShiftKey || vk == (int)Keys.RShiftKey) _down[(int)Keys.ShiftKey] = true;
+                if (vk == (int)Keys.LMenu || vk == (int)Keys.RMenu) _down[(int)Keys.Menu] = true;
             }
-            else if (isUp)
+            else if (vk == (int)Keys.LControlKey || vk == (int)Keys.RControlKey)
+            { if (!_down[(int)Keys.LControlKey] && !_down[(int)Keys.RControlKey]) _down[(int)Keys.ControlKey] = false; }
+            else if (vk == (int)Keys.LShiftKey || vk == (int)Keys.RShiftKey)
+            { if (!_down[(int)Keys.LShiftKey] && !_down[(int)Keys.RShiftKey]) _down[(int)Keys.ShiftKey] = false; }
+            else if (vk == (int)Keys.LMenu || vk == (int)Keys.RMenu)
+            { if (!_down[(int)Keys.LMenu] && !_down[(int)Keys.RMenu]) _down[(int)Keys.Menu] = false; }
+            bool consume = vk == _consumedKey;
+            if (!down)
             {
-                if (IsCtrl(vk))
-                {
-                    _ctrlDown = false;
-                    if (_armed && !(GetAsyncKeyState(VK_SPACE) < 0))
-                    {
-                        _armed = false;
-                        _spaceConsumed = false;
-                        Raise(Released);
-                    }
-                }
-                else if (vk == VK_SPACE)
-                {
-                    if (_spaceConsumed)
-                    {
-                        _spaceConsumed = false;
-                        if (_armed)
-                        {
-                            _armed = false;
-                            Raise(Released);
-                        }
-                        return (IntPtr)1;
-                    }
-                }
+                if (consume) _consumedKey = -1;
+                if (_armed && (vk == (int)_shortcut.Key ||
+                    (CurrentModifiers() & _shortcut.Modifiers) != _shortcut.Modifiers))
+                { _armed = false; Raise(Released); }
+                return consume;
             }
-
-            return CallNextHookEx(_hook, nCode, wParam, lParam);
+            if (vk == (int)Keys.Escape && _armed)
+            { _armed = false; Raise(Cancelled); return true; }
+            if (consume) return true; // Swallow repeats, even after a modifier was released.
+            if (_enabled && !repeat && !_armed && vk == (int)_shortcut.Key &&
+                CurrentModifiers() == _shortcut.Modifiers && !_down[(int)Keys.LWin] && !_down[(int)Keys.RWin])
+            {
+                _consumedKey = vk;
+                _armed = true;
+                Raise(Pressed);
+                return true;
+            }
+            return false;
         }
-
         static void Raise(MethodInvoker handler)
         {
             if (handler == null) return;
-            try { handler(); }
-            catch (Exception ex) { TrayApp.Log("hotkey handler error: " + ex.Message); }
+            try { handler(); } catch (Exception ex) { TrayApp.Log("hotkey handler error: " + ex.Message); }
         }
     }
 }

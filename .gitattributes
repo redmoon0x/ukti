@@ -1,0 +1,3 @@
+# Preserve upstream legal text without flagging its original formatting as
+# source-code whitespace errors. Application code keeps the normal checks.
+packaging/licenses/** -whitespace

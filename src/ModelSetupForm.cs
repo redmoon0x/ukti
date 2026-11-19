@@ -1,268 +1,361 @@
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
-using System.Security.Cryptography;
 using System.Threading;
 using System.Windows.Forms;
 
 namespace Ukti
 {
-    // First-run model download.
-    //
-    // Shipping the 700 MB weights inside the installer would make the download
-    // unwieldy and drag model licensing into the installer, so the app fetches
-    // them once, into its own folder, and verifies the result before using it.
-    sealed class ModelSetupForm : Form
+    // One library for first-run setup and changing models later. Downloading
+    // only populates the local cache; the caller decides when to activate it.
+    sealed class ModelSetupForm : ThemedForm
     {
-        // Pinned release of the English streaming model. The hash comes from the
-        // runtime's own model index, so a corrupted or substituted download is
-        // rejected rather than silently loaded.
-        const string ModelUrl =
-            "https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b/resolve/" +
-            "ebe59e5a817142986528bbbee5dba8db7b38ed50/nemotron-speech-streaming-en-0.6b.q8_0.gguf";
-        const long ExpectedBytes = 699872960L;
-        const string ExpectedSha256 = "d9a01898d2a611c8764e23a1c2f45e70bbd5a425dc4de93692ac951dd603812d";
-
-        readonly Label _status = new Label();
-        readonly ProgressBar _progress = new ProgressBar();
-        readonly HexButton _download = new HexButton();
-        readonly HexButton _quit = new HexButton();
-        readonly string _targetPath;
-
+        readonly string _directory;
+        readonly ModelChoice[] _choices;
+        readonly Label _status;
+        readonly LinkLabel _license;
+        readonly HexButton _download, _quit, _delete;
+        readonly string _protectedModelId;
+        readonly Func<SpeechModel, bool> _confirmDelete;
+        SpeechModel _selected;
         WebClient _client;
-        bool _done;
+        volatile bool _cancelled;
+        bool _busy, _done;
+        int _progressValue;
+        string _partialPath;
+        public SpeechModel SelectedModel { get; private set; }
 
-        public ModelSetupForm(string targetPath)
+        public ModelSetupForm(SpeechModel selected, string directory = null, string protectedModelId = null,
+                              Func<SpeechModel, bool> confirmDelete = null)
         {
-            _targetPath = targetPath;
-
-            Text = "Ukti setup";
-            FormBorderStyle = FormBorderStyle.None;
-            StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(496, 268);
-            Font = new Font("Segoe UI", 9f);
-            BackColor = Theme.BgBase;
-            ForeColor = Theme.TextBase;
-            ShowInTaskbar = true;
-            DoubleBuffered = true;
-            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint |
-                     ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-
-            _progress.Location = new Point(24, 176);
-            _progress.Size = new Size(448, 6);
-            _progress.Style = ProgressBarStyle.Continuous;
-            Controls.Add(_progress);
-
-            _status.Location = new Point(24, 192);
-            _status.AutoSize = true;
-            _status.ForeColor = Theme.TextFaint;
-            _status.BackColor = Color.Transparent;
-            _status.Text = "Not downloaded yet";
-            Controls.Add(_status);
-
-            _download = new HexButton();
-            _download.Text = "Download model";
-            _download.Primary = true;
-            _download.Bounds = new Rectangle(280, 220, 132, 32);
-            _download.Click += delegate { StartDownload(); };
-            Controls.Add(_download);
-
+            _directory = directory ?? ModelCatalog.DirectoryPath;
+            _protectedModelId = protectedModelId;
+            _confirmDelete = confirmDelete ?? ConfirmDeletion;
+            _selected = selected ?? ModelCatalog.All[0];
+            Text = "Ukti speech models";
+            ClientSize = new Size(680, 640);
+            AddCloseButton(628).TabIndex = 8;
+            AddLabel("Speech models", new Rectangle(72, 24, 520, 32), 15f, Theme.Ink, true);
+            AddLabel("Choose what works for you. Every model runs on this PC.",
+                new Rectangle(24, 70, 632, 24), 9.5f, Theme.MutedInk, false);
+            _choices = new ModelChoice[ModelCatalog.All.Length];
+            for (int i = 0; i < _choices.Length; i++)
+            {
+                SpeechModel model = ModelCatalog.All[i];
+                ModelChoice choice = new ModelChoice(model, ModelCatalog.IsInstalled(model, _directory));
+                choice.Bounds = new Rectangle(24, 110 + i * 84, 632, 76);
+                choice.TabIndex = i;
+                choice.Click += delegate { SelectModel(model); };
+                Controls.Add(choice);
+                _choices[i] = choice;
+            }
+            _license = new LinkLabel();
+            _license.Bounds = new Rectangle(24, 452, 632, 24);
+            _license.BackColor = Color.Transparent;
+            _license.LinkColor = _license.ActiveLinkColor = _license.VisitedLinkColor = Theme.MutedInk;
+            _license.LinkBehavior = LinkBehavior.HoverUnderline;
+            _license.UseMnemonic = false;
+            _license.TabIndex = 4;
+            _license.LinkClicked += delegate
+            {
+                try { Process.Start(_selected.LicenseUrl); }
+                catch (Exception ex) { SetStatus("Could not open the model card: " + ex.Message, true); }
+            };
+            Controls.Add(_license);
+            _status = AddLabel("", new Rectangle(24, 496, 632, 52), 9f, Theme.MutedInk, false);
+            _status.AccessibleName = "Model download status";
             _quit = new HexButton();
-            _quit.Text = "Quit";
-            _quit.Bounds = new Rectangle(420, 220, 56, 32);
-            _quit.Click += delegate
-            {
-                DialogResult = DialogResult.Cancel;
-                Close();
-            };
+            _quit.Text = "Cancel";
+            _quit.Bounds = new Rectangle(386, 574, 100, 38);
+            _quit.TabIndex = 6;
+            _quit.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
             Controls.Add(_quit);
-
-            FormClosing += delegate
-            {
-                if (!_done && _client != null) _client.CancelAsync();
-            };
+            _download = new HexButton();
+            _download.Primary = true;
+            _download.Bounds = new Rectangle(496, 574, 160, 38);
+            _download.TabIndex = 7;
+            _download.Click += delegate { UseOrDownload(); };
+            Controls.Add(_download);
+            _delete = new HexButton();
+            _delete.Text = "Delete model";
+            _delete.AccessibleDescription = "Permanently remove this model's downloaded files after confirmation.";
+            _delete.Bounds = new Rectangle(24, 574, 132, 38);
+            _delete.TabIndex = 5;
+            _delete.Click += delegate { DeleteSelectedModel(); };
+            Controls.Add(_delete);
+            AcceptButton = _download;
+            CancelButton = _quit;
+            SelectModel(_selected);
+            ActiveControl = _choices[Array.IndexOf(ModelCatalog.All, ModelCatalog.Find(_selected.Id))];
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        void SelectModel(SpeechModel model)
         {
-            Graphics g = e.Graphics;
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-            g.Clear(Theme.BgBase);
-
-            Theme.DrawMark(g, new RectangleF(24, 22, 20, 20), Theme.TextBase);
-
-            using (Font title = new Font("Segoe UI", 11f, FontStyle.Bold))
-            using (SolidBrush b = new SolidBrush(Theme.TextBase))
-                g.DrawString("Speech model", title, b, 52, 21);
-
-            using (Font body = new Font("Segoe UI", 9f))
-            using (SolidBrush b = new SolidBrush(Theme.TextMuted))
+            if (_busy) return;
+            _selected = model;
+            RefreshChoices();
+            foreach (ModelChoice choice in _choices) choice.Selected = choice.Model.Id == model.Id;
+            _license.Text = "Model card & license: " + model.License;
+            bool installed = ModelCatalog.IsInstalled(model, _directory);
+            _download.Text = installed ? "Use model" : "Download & use";
+            UpdateDeleteButton();
+            SetStatus(model.Id == _protectedModelId ? "Current model. Save a different model in Settings before deleting this one." :
+                installed ? "Downloaded. Ready offline. Delete model removes its files from this PC." :
+                model.SizeText + " download / Q8_0 / NVIDIA GPU required. No audio is uploaded.", false);
+            _progressValue = 0;
+            Invalidate();
+        }
+        void RefreshChoices()
+        {
+            foreach (ModelChoice choice in _choices)
             {
-                g.DrawString("Ukti transcribes on this PC, so your voice never leaves it.", body, b, 24, 66);
-                g.DrawString("The model is a one-time download of about 700 MB and is stored", body, b, 24, 88);
-                g.DrawString("in this app's folder.", body, b, 24, 110);
-            }
-
-            using (Pen p = new Pen(Theme.BorderWeak, 1f))
-                g.DrawLine(p, 24, 146, 472, 146);
-
-            // Progress track.
-            using (GraphicsPath path = Theme.RoundedRect(new Rectangle(24, 176, 448, 6), 3))
-            using (SolidBrush b = new SolidBrush(Theme.Alpha(Color.White, 0.08f)))
-                g.FillPath(b, path);
-
-            int filled = (int)(448 * (_progress.Value / 100f));
-            if (filled > 0)
-            {
-                using (GraphicsPath path = Theme.RoundedRect(new Rectangle(24, 176, Math.Max(filled, 6), 6), 3))
-                using (SolidBrush b = new SolidBrush(Theme.BgContrast))
-                    g.FillPath(b, path);
+                choice.Installed = ModelCatalog.IsInstalled(choice.Model, _directory);
+                choice.IsCurrent = choice.Model.Id == _protectedModelId;
             }
         }
-
-        void StartDownload()
+        void UpdateDeleteButton()
         {
-            _download.Enabled = false;
-            _status.Text = "Connecting...";
-
+            _delete.Enabled = !_busy && _selected.Id != _protectedModelId && ModelCatalog.HasStoredFiles(_selected, _directory);
+            _delete.AccessibleDescription = _selected.Id == _protectedModelId ?
+                "The current model is protected. Save a different model in Settings first." :
+                "Permanently remove this model's downloaded files after confirmation.";
+        }
+        bool ConfirmDeletion(SpeechModel model)
+        {
+            long bytes = ModelCatalog.StoredBytes(model, _directory);
+            return MessageBox.Show(this, "Delete " + model.Name + " from this PC?\n\nThis permanently removes " +
+                (bytes / 1000000.0).ToString("0.##") + " MB of model files. You can download it again later.",
+                "Delete speech model", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+        }
+        void DeleteSelectedModel()
+        {
+            if (_busy) return;
+            if (_selected.Id == _protectedModelId)
+            { SetStatus("Save a different model in Settings before deleting the current model.", true); return; }
+            if (!ModelCatalog.HasStoredFiles(_selected, _directory)) return;
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(_targetPath));
-
-                // .NET Framework still negotiates TLS 1.0 by default on some
-                // machines, which Hugging Face rejects. The model host requires
-                // at least 1.2.
-                ServicePointManager.SecurityProtocol =
-                    SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls;
-
-                _client = new WebClient();
-                _client.DownloadProgressChanged += OnProgress;
-                _client.DownloadFileCompleted += OnComplete;
-
-                // Download beside the final name so a partial file is never
-                // picked up as a usable model.
-                _client.DownloadFileAsync(new Uri(ModelUrl), _targetPath + ".partial");
+                if (!_confirmDelete(_selected)) return;
+                ModelCatalog.DeleteFiles(_selected, _directory, _protectedModelId);
+                SelectModel(_selected);
+                SetStatus("Deleted " + _selected.Name + ". You can download it again at any time.", false);
             }
             catch (Exception ex)
             {
-                Fail("Could not start the download: " + ex.Message);
+                SelectModel(_selected);
+                SetStatus("Could not delete all model files: " + ex.Message, true);
             }
         }
-
+        void SetStatus(string text, bool error)
+        {
+            _status.Text = text;
+            _status.ForeColor = error ? Theme.Danger : Theme.MutedInk;
+            _status.AccessibleDescription = text;
+        }
+        void SetBusy(bool busy)
+        {
+            _busy = busy;
+            foreach (ModelChoice choice in _choices) choice.Enabled = !busy;
+            _license.Enabled = !busy;
+            _download.Enabled = !busy;
+            UpdateDeleteButton();
+            _quit.Text = busy ? "Cancel download" : "Cancel";
+            _quit.Width = busy ? 132 : 100;
+            _quit.Left = 486 - _quit.Width;
+        }
+        void CompleteSelection()
+        {
+            SelectedModel = _selected;
+            _done = true;
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+        void UseOrDownload()
+        {
+            if (_busy) return;
+            if (ModelCatalog.IsInstalled(_selected, _directory)) { CompleteSelection(); return; }
+            SetBusy(true);
+            SetStatus("Connecting to Hugging Face\u2026", false);
+            _progressValue = 0;
+            Invalidate();
+            try
+            {
+                Directory.CreateDirectory(_directory);
+                DriveInfo drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(_directory)));
+                if (drive.IsReady && drive.AvailableFreeSpace < _selected.Bytes + 67108864L)
+                    throw new IOException("Not enough free disk space for this model.");
+                _partialPath = Path.Combine(_directory, _selected.FileName + "." + Guid.NewGuid().ToString("N") + ".partial");
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                _client = new WebClient();
+                _client.DownloadProgressChanged += OnProgress;
+                _client.DownloadFileCompleted += OnComplete;
+                _client.DownloadFileAsync(new Uri(_selected.Url), _partialPath);
+            }
+            catch (Exception ex) { Fail("Could not start the download: " + ex.Message); }
+        }
         void OnProgress(object sender, DownloadProgressChangedEventArgs e)
         {
-            // Report against the known size so the bar is honest even if the
-            // server omits a content length.
-            long total = e.TotalBytesToReceive > 0 ? e.TotalBytesToReceive : ExpectedBytes;
-            int percent = (int)(100.0 * e.BytesReceived / Math.Max(total, 1));
-            if (percent < 0) percent = 0;
-            if (percent > 100) percent = 100;
-
-            _progress.Value = percent;
-            _status.Text = string.Format("{0:0.0} MB of {1:0} MB  ({2}%)",
-                e.BytesReceived / 1048576.0, total / 1048576.0, percent);
+            if (_cancelled || IsDisposed) return;
+            _progressValue = Math.Max(0, Math.Min(100, (int)(100.0 * e.BytesReceived / _selected.Bytes)));
+            SetStatus(string.Format("{0:0} MB of {1:0} MB  /  {2}%", e.BytesReceived / 1000000.0,
+                _selected.Bytes / 1000000.0, _progressValue), false);
+            Invalidate(new Rectangle(24, 484, 632, 4));
         }
-
         void OnComplete(object sender, AsyncCompletedEventArgs e)
         {
-            if (e.Cancelled)
+            if (_client != null) { _client.Dispose(); _client = null; }
+            if (_cancelled || e.Cancelled) { CleanupPartial(); return; }
+            if (e.Error != null) { Fail("Download failed: " + e.Error.Message); return; }
+            SetStatus("Verifying the download\u2026", false);
+            SpeechModel model = _selected;
+            Thread verify = new Thread(delegate()
             {
-                Fail("Download cancelled.");
-                return;
-            }
-            if (e.Error != null)
-            {
-                Fail("Download failed: " + e.Error.Message);
-                return;
-            }
-
-            _status.Text = "Verifying...";
-            Application.DoEvents();
-
-            // Verification runs off the UI thread: hashing 700 MB takes a moment
-            // and would otherwise freeze the window.
-            Thread verify = new Thread(delegate ()
-            {
-                string error = Verify();
-                if (IsDisposed) return;
-                BeginInvoke((MethodInvoker)delegate
+                string error;
+                try { error = ModelCatalog.VerifyFile(_partialPath, model, delegate { return _cancelled; }); }
+                catch (OperationCanceledException) { CleanupPartial(); return; }
+                catch (Exception ex) { error = "Could not verify the download: " + ex.Message; }
+                if (_cancelled) { CleanupPartial(); return; }
+                try
                 {
-                    if (error == null)
+                    BeginInvoke((MethodInvoker)delegate
                     {
-                        _done = true;
-                        _progress.Value = 100;
-                        _status.Text = "Ready";
-                        DialogResult = DialogResult.OK;
-                        Close();
-                    }
-                    else
-                    {
-                        Fail(error);
-                    }
-                });
+                        if (_cancelled || IsDisposed) { CleanupPartial(); return; }
+                        if (error != null) { Fail(error); return; }
+                        try
+                        {
+                            string target = Path.Combine(_directory, model.FileName);
+                            // Promote only a verified file; never destroy a working model on failure.
+                            if (File.Exists(target)) File.Replace(_partialPath, target, null);
+                            else File.Move(_partialPath, target);
+                            _partialPath = null;
+                            CompleteSelection();
+                        }
+                        catch (Exception ex) { Fail("Could not save the model: " + ex.Message); }
+                    });
+                }
+                catch (InvalidOperationException) { CleanupPartial(); }
             });
             verify.IsBackground = true;
             verify.Start();
         }
-
-        string Verify()
+        void CleanupPartial()
         {
-            string partial = _targetPath + ".partial";
-            try
-            {
-                FileInfo info = new FileInfo(partial);
-                if (!info.Exists) return "The downloaded file is missing.";
-                if (info.Length != ExpectedBytes)
-                {
-                    return string.Format("The download is incomplete or wrong: {0:0.0} MB, expected {1:0.0} MB.",
-                        info.Length / 1048576.0, ExpectedBytes / 1048576.0);
-                }
-
-                string actual = Sha256(partial);
-                if (!string.Equals(actual, ExpectedSha256, StringComparison.OrdinalIgnoreCase))
-                {
-                    return "The downloaded file failed its integrity check.";
-                }
-
-                if (File.Exists(_targetPath)) File.Delete(_targetPath);
-                File.Move(partial, _targetPath);
-                return null;
-            }
-            catch (Exception ex)
-            {
-                return "Could not verify the download: " + ex.Message;
-            }
+            try { if (_partialPath != null && File.Exists(_partialPath)) File.Delete(_partialPath); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
-
-        static string Sha256(string path)
-        {
-            using (SHA256 sha = SHA256.Create())
-            using (FileStream stream = File.OpenRead(path))
-            {
-                byte[] hash = sha.ComputeHash(stream);
-                System.Text.StringBuilder sb = new System.Text.StringBuilder(hash.Length * 2);
-                foreach (byte b in hash) sb.Append(b.ToString("x2"));
-                return sb.ToString();
-            }
-        }
-
         void Fail(string message)
         {
-            try { if (File.Exists(_targetPath + ".partial")) File.Delete(_targetPath + ".partial"); }
-            catch { }
-
-            // The form may already be closing (for example when the user quit
-            // mid-download), in which case touching a control would throw.
-            if (IsDisposed || Disposing || !IsHandleCreated) return;
-
-            _status.Text = message;
-            _status.ForeColor = Color.FromArgb(229, 77, 66);
+            if (_client != null) { _client.Dispose(); _client = null; }
+            CleanupPartial();
+            if (IsDisposed || Disposing || _cancelled) return;
+            SetBusy(false);
             _download.Text = "Try again";
-            _download.Enabled = true;
+            SetStatus(message, true);
+        }
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!_done)
+            {
+                _cancelled = true;
+                if (_client != null) _client.CancelAsync();
+                // CancelAsync can release the writer immediately. If a writer
+                // or verifier still owns the file, its completion cleans up.
+                CleanupPartial();
+            }
+            base.OnFormClosing(e);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Theme.DrawMark(g, new RectangleF(24, 23, 36, 36), Theme.Ink);
+            Rectangle track = new Rectangle(24, 484, 632, 4);
+            using (GraphicsPath path = Theme.RoundedRect(track, 2))
+            using (SolidBrush b = new SolidBrush(Theme.Layer02)) g.FillPath(b, path);
+            int filled = (int)(632 * _progressValue / 100f);
+            if (filled > 0)
+                using (GraphicsPath path = Theme.RoundedRect(new Rectangle(24, 484, Math.Max(4, filled), 4), 2))
+                using (SolidBrush b = new SolidBrush(Theme.Ink)) g.FillPath(b, path);
+        }
+    }
+
+    sealed class ModelChoice : ActionControl
+    {
+        public readonly SpeechModel Model;
+        bool _installed;
+        public bool IsCurrent { get; set; }
+        public bool Installed
+        {
+            get { return _installed; }
+            set { _installed = value; AccessibleDescription = Model.Description + ". " + Model.SizeText + (value ? ". Downloaded." : ". Not downloaded."); Invalidate(); }
+        }
+        bool _selected;
+        public bool Selected
+        {
+            get { return _selected; }
+            set { bool changed = value != _selected; _selected = value; Invalidate(); if (changed && IsHandleCreated) AccessibilityNotifyClients(AccessibleEvents.StateChange, -1); }
+        }
+        public ModelChoice(SpeechModel model, bool installed)
+        {
+            Model = model;
+            Installed = installed;
+            AccessibleName = model.Name;
+            AccessibleRole = AccessibleRole.RadioButton;
+        }
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys key = keyData & Keys.KeyCode;
+            return key == Keys.Enter || key == Keys.Up || key == Keys.Down || key == Keys.Left || key == Keys.Right || base.IsInputKey(keyData);
+        }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Up || e.KeyCode == Keys.Down || e.KeyCode == Keys.Left || e.KeyCode == Keys.Right)
+            {
+                List<ModelChoice> choices = new List<ModelChoice>();
+                if (Parent != null) foreach (Control control in Parent.Controls) if (control is ModelChoice) choices.Add((ModelChoice)control);
+                int direction = e.KeyCode == Keys.Up || e.KeyCode == Keys.Left ? -1 : 1;
+                if (choices.Count > 0)
+                {
+                    ModelChoice next = choices[(choices.IndexOf(this) + direction + choices.Count) % choices.Count];
+                    next.Focus(); next.ActivateControl();
+                }
+                e.Handled = e.SuppressKeyPress = true;
+                return;
+            }
+            base.OnKeyDown(e);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Rectangle bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+            Theme.DrawSurface(g, bounds, _selected || Hovered ? Theme.Layer01 : Theme.BgBase, 10);
+            if (_selected)
+                using (GraphicsPath path = Theme.RoundedRect(bounds, 10))
+                using (Pen p = new Pen(Theme.MutedInk)) g.DrawPath(p, path);
+            using (Pen p = new Pen(_selected ? Theme.Ink : Theme.FaintInk, 1.3f)) g.DrawEllipse(p, 16, 30, 14, 14);
+            if (_selected) using (SolidBrush b = new SolidBrush(Theme.Ink)) g.FillEllipse(b, 20, 34, 6, 6);
+            Theme.DrawText(g, Model.Name, 10.5f, Theme.Ink, new Rectangle(46, 12, Width - 220, 24), true);
+            Theme.DrawText(g, IsCurrent ? "Current" : _installed ? "Downloaded" : Model.SizeText, 8.5f, Theme.MutedInk,
+                new Rectangle(Width - 120, 12, 104, 24), false);
+            Theme.DrawText(g, Model.Description, 9f, Theme.MutedInk, new Rectangle(46, 40, Width - 62, 24), false);
+            DrawFocus(g);
+        }
+        protected override AccessibleObject CreateAccessibilityInstance() { return new ChoiceAccessibleObject(this); }
+        sealed class ChoiceAccessibleObject : ControlAccessibleObject
+        {
+            readonly ModelChoice _owner;
+            public ChoiceAccessibleObject(ModelChoice owner) : base(owner) { _owner = owner; }
+            public override AccessibleStates State { get { return base.State | (_owner.Selected ? AccessibleStates.Checked : 0); } }
+            public override void DoDefaultAction() { _owner.ActivateControl(); }
+            public override string DefaultAction { get { return "Select"; } }
         }
     }
 }

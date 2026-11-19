@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>Ukti</AssemblyName>
+    <RootNamespace>Ukti</RootNamespace>
+    <UseWindowsForms>true</UseWindowsForms>
+    <GenerateResourceUsePreserializedResources>true</GenerateResourceUsePreserializedResources>
+    <ApplicationIcon>src\assets\ukti.ico</ApplicationIcon>
+    <ApplicationManifest>src\app.manifest</ApplicationManifest>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>app\</OutputPath>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <Deterministic>true</Deterministic>
+    <DebugType>none</DebugType>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="src\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="src\assets\ukti-glyph.png" LogicalName="ukti-glyph.png" />
+    <EmbeddedResource Include="src\assets\ukti.ico" LogicalName="ukti.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Buffers" Version="4.5.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
+  </ItemGroup>
+</Project>

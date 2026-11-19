@@ -1,0 +1,42 @@
+Bundled third-party notices
+
+NeMo-Speech.cpp 0.3.0 Windows x86_64 CUDA runtime
+https://github.com/NVIDIA/NeMo-Speech.cpp/releases/tag/v0.3.0
+Archive: nemo-speech-0.3.0-windows-x86_64-cuda.zip
+Published archive SHA-256:
+d0d32ae1bf6ee0534767a47b2aa0e9e2ff6fe39643465c0baae9301d04f6ed42
+The NeMo-Speech directory is copied, without modification, from the official
+archive's share/licenses/nemo-speech directory. It includes the CUDA EULA and
+upstream source/component attribution. Only the ASR runtime dependency set and
+app-local Microsoft C/C++ runtime DLLs are installed. The web setup downloads
+and verifies that archive (or reuses matching local DLLs); the optional offline
+setup embeds the same DLLs. Neither includes speech models, command-line tools,
+NMT or TTS programs.
+Corresponding upstream source: https://github.com/NVIDIA/NeMo-Speech.cpp/tree/v0.3.0
+
+Microsoft managed libraries
+System.Buffers 4.5.1
+System.Runtime.CompilerServices.Unsafe 4.5.3
+System.Threading.Channels 8.0.0
+System.Threading.Tasks.Extensions 4.5.4
+LICENSE.TXT files are copied from the respective official NuGet packages.
+
+Microsoft Visual C++ runtime
+App-local runtime DLLs from the official NVIDIA runtime archive above.
+Microsoft's runtime license is included as Visual-C-Runtime-License.txt,
+transcribed from the official document linked by:
+https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/
+https://visualstudio.microsoft.com/wp-content/uploads/2021/09/Visual-C-Runtime-2015-2022-License-1.docx
+
+Hex dot-scope design/implementation attribution (MIT)
+https://github.com/anomalyco/hex/tree/648ec4725a6cca53dad9b84ec718675cf293cf1a
+
+NSIS 3.11 installer engine
+https://nsis.sourceforge.io/
+Archive: https://prdownloads.sourceforge.net/nsis/nsis-3.11.zip
+SHA-256: c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1
+
+The NVIDIA speech model is NOT bundled. On first launch, the user downloads a
+model directly from the pinned official location under its separately linked
+license. No build-machine settings, audio, model weights, logs, or crash dumps
+are part of this distribution.

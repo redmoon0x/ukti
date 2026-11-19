@@ -2,6 +2,7 @@
 app/
 bin/
 obj/
+dist/
 *.exe
 *.pdb
 
@@ -15,9 +16,24 @@ models/
 *.lib
 *.exp
 
-# Local state
+# Local state, diagnostic artifacts and temporary test output
 settings.txt
+*.log
+*.dmp
+*.tmp
+*.partial
+*.zip
+TestResults/
+__pycache__/
+.vs/
 docs/*.local.png
+
+# Local credentials / code-signing private keys
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
 
 # OS noise
 Thumbs.db

@@ -1,668 +1,729 @@
 using System;
 using System.Diagnostics;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
-using System.Media;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
 namespace Ukti
 {
-    enum AppState { Loading, Idle, Recording, Working, Faulted }
+
 
     sealed class TrayApp : ApplicationContext
     {
-        const string HotkeyText = "Ctrl+Space";
-
-        readonly NotifyIcon _tray;
-        readonly string _modelPath;
-        readonly PillForm _pill;
-        readonly HoldHotkey _hotkey;
-
-        // Lives on the UI thread and anchors all cross-thread marshalling.
-        // A low-level keyboard hook only fires on a thread that pumps messages,
-        // so the hook must be installed through this control, never from the
-        // background loader thread.
-        readonly Control _dispatcher;
-
         sealed class DispatcherWindow : Control
         {
-            // A recognisable title lets a second process find this window, so a
-            // relaunch can ask the running instance to show its settings. The
-            // class name is left alone: overriding CreateParams.ClassName makes
-            // WinForms try to register a new window class, which fails.
-            public DispatcherWindow()
-            {
-                Text = Ipc.WindowTitle;
-                // Force a real window handle: InvokeRequired and BeginInvoke are
-                // meaningless without one, and without a live handle on this
-                // thread the keyboard hook would never receive a callback.
-                IntPtr force = Handle;
-                GC.KeepAlive(force);
-            }
-
             public event MethodInvoker ShowRequested;
+            public event MethodInvoker ThemeChange;
+            public Func<IntPtr, bool> RawInput;
 
-            protected override void WndProc(ref Message m)
+            public DispatcherWindow() { Text = Ipc.WindowTitle; IntPtr handle = Handle; GC.KeepAlive(handle); }
+            protected override void WndProc(ref Message message)
             {
-                if (m.Msg == (int)Ipc.ShowMessage)
+                if (message.Msg == (int)Ipc.ShowMessage)
+                { if (ShowRequested != null) ShowRequested(); return; }
+                if (message.Msg == 0x00FF /* WM_INPUT */ && RawInput != null && RawInput(message.LParam)) return;
+                // System theme/DWM changes: repaint the custom-drawn dark UI.
+                if (message.Msg == 0x001A /* WM_SETTINGCHANGE */ || message.Msg == 0x0320 /* WM_DWMCOLORIZATIONCOLORCHANGED */)
                 {
-                    MethodInvoker handler = ShowRequested;
-                    if (handler != null)
-                    {
-                        try { handler(); }
-                        catch { }
-                    }
+                    if (ThemeChange != null) ThemeChange();
                     return;
                 }
-                base.WndProc(ref m);
+                base.WndProc(ref message);
             }
         }
-
-        AppState _state = AppState.Loading;
-        NemoAsr _asr;
-        AudioCapture _mic;
-        IntPtr _targetWindow = IntPtr.Zero;
-        string _lastText = string.Empty;
-        Settings _settings;
-        readonly bool _startInBackground;
-        System.Windows.Forms.Timer _trimTimer;
-        readonly Stopwatch _since = Stopwatch.StartNew();
-
-        // The runtime is not thread-safe; all inference goes through this gate.
+        readonly DispatcherWindow _dispatcher;
+        readonly NotifyIcon _tray;
+        readonly PillForm _pill;
+        readonly HoldHotkey _hotkey;
+        readonly Settings _settings;
+        readonly WorkCoordinator _work;
         readonly object _inferGate = new object();
+        readonly bool _startInBackground;
+        readonly Stopwatch _idleClock = Stopwatch.StartNew();
+        readonly System.Windows.Forms.Timer _idleTimer;
+        string _loadedModelPath;
+        SpeechModel _pendingModel;
+        string _pendingModelPath;
+        System.Threading.CancellationTokenSource _wakeToken;
+        System.Threading.CancellationTokenSource _transcribeToken;
+        bool _wakeHeld, _wakeCancelled;
+        float[] _wakeSamples;
+        IAsrEngine _asr;
+        AudioCapture _mic;
+        SettingsForm _settingsForm;
+        AppState _state = AppState.Loading;
+        IntPtr _targetWindow;
+        TargetIdentity _targetIdentity;
+        string _lastText = "";
+        volatile bool _exiting;
+        int _captureVersion;
+        System.Windows.Forms.Timer _pasteTimer;
+        string HotkeyText { get { return _settings.GetShortcut().ToString(); } }
 
-        public TrayApp(bool startInBackground)
+        public TrayApp(bool startInBackground) : this(startInBackground, true) { }
+        internal TrayApp(bool startInBackground, bool startEngine)
         {
-            _modelPath = ResolveModelPath();
             _settings = Settings.Load();
             _startInBackground = startInBackground;
-
+            _work = new WorkCoordinator(delegate (Action action) { Post(new MethodInvoker(action)); });
             _dispatcher = new DispatcherWindow();
-            ((DispatcherWindow)_dispatcher).ShowRequested += delegate
-            {
-                ShowSettings();
-            };
 
             _pill = new PillForm();
-            _pill.CaptureLevel = delegate { return _mic != null ? _mic.Level : 0f; };
-
+            _pill.CaptureLevel = delegate { AudioCapture mic = _mic; return mic != null ? mic.Level : 0f; };
+            _dispatcher.ThemeChange += delegate
+            {
+                _pill.Invalidate(true);
+                if (_settingsForm != null) _settingsForm.Invalidate(true);
+            };
+            _hotkey = new HoldHotkey();
+            _hotkey.Configure(_settings.GetShortcut());
+            _dispatcher.RawInput = _hotkey.HandleRawInput;
+            _hotkey.Pressed += StartRecording;
+            _hotkey.Released += StopAndTranscribe;
+            _hotkey.Cancelled += CancelRecording;
             _tray = new NotifyIcon();
             _tray.ContextMenuStrip = BuildMenu();
             _tray.Visible = true;
-            _tray.DoubleClick += delegate { ShowLastText(); };
+            _tray.DoubleClick += delegate { ShowSettings(false); };
 
-            _hotkey = new HoldHotkey();
-            _hotkey.Pressed += OnHotkeyPressed;
-            _hotkey.Released += OnHotkeyReleased;
-            _hotkey.Cancelled += OnHotkeyCancelled;
-
-            SetState(AppState.Loading, "Loading speech model...");
-
-            Thread loader = new Thread(LoadModel);
-            loader.IsBackground = true;
-            loader.SetApartmentState(ApartmentState.STA);
-            loader.Start();
-        }
-
-        static string ResolveModelPath()
-        {
-            string explicitPath = Environment.GetEnvironmentVariable("VT_MODEL");
-            if (!string.IsNullOrEmpty(explicitPath) && File.Exists(explicitPath)) return explicitPath;
-
-            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            string[] candidates =
+            _idleTimer = new System.Windows.Forms.Timer();
+            _idleTimer.Interval = 1000;
+            _idleTimer.Tick += delegate { TryUnloadIdleModel(_idleClock.Elapsed); };
+            SetState(AppState.Loading, "Loading speech model\u2026");
+            if (startEngine)
             {
-                // English-only model first: it is smaller and slightly faster
-                // than the multilingual one, at the same accuracy for English.
-                Path.Combine(baseDir, "models", "nemotron-en.q8_0.gguf"),
-                Path.Combine(baseDir, "nemotron-en.q8_0.gguf"),
-                Path.Combine(baseDir, "models", "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"),
-                Path.Combine(baseDir, "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"),
-            };
-            foreach (string c in candidates)
-                if (File.Exists(c)) return c;
-            return candidates[0];
+                _idleTimer.Start(); // Also ticks inside the modal Settings loop.
+                _dispatcher.BeginInvoke((MethodInvoker)BeginStartup);
+            }
         }
-
+        void BeginStartup()
+        {
+            if (_exiting) return;
+            if (_settings.RunAtStartup) Startup.Apply(true);
+            SpeechModel model = ModelCatalog.Find(_settings.ModelId);
+            string path = ModelCatalog.PathFor(model, ModelCatalog.DirectoryPath);
+            string custom = Environment.GetEnvironmentVariable("VT_MODEL");
+            if (!string.IsNullOrEmpty(custom) && File.Exists(custom)) path = custom;
+            else if (!ModelCatalog.IsInstalled(model, ModelCatalog.DirectoryPath))
+            {
+                using (ModelSetupForm setup = new ModelSetupForm(model))
+                {
+                    if (setup.ShowDialog() != DialogResult.OK)
+                    { SetState(AppState.Faulted, "Choose a speech model in Settings"); return; }
+                    model = setup.SelectedModel;
+                    path = ModelCatalog.PathFor(model, ModelCatalog.DirectoryPath);
+                }
+            }
+            StartModelLoad(model, path, !_startInBackground || !_settings.FirstRunDone);
+        }
         ContextMenuStrip BuildMenu()
         {
             ContextMenuStrip menu = new ContextMenuStrip();
-
-            ToolStripMenuItem status = new ToolStripMenuItem("Starting...");
-            status.Enabled = false;
-            status.Name = "status";
-            menu.Items.Add(status);
-
+            HexMenuRenderer.Style(menu);
+            ToolStripMenuItem status = new ToolStripMenuItem("Starting\u2026");
+            status.Name = "status"; status.Enabled = false; menu.Items.Add(status);
             menu.Items.Add(new ToolStripSeparator());
-
             ToolStripMenuItem hint = new ToolStripMenuItem("Hold " + HotkeyText + " to dictate");
-            hint.Enabled = false;
-            menu.Items.Add(hint);
-
+            hint.Name = "shortcutHint"; hint.Enabled = false; menu.Items.Add(hint);
+            ToolStripMenuItem enable = new ToolStripMenuItem("Enable dictation");
+            enable.Name = "enable"; enable.CheckOnClick = true; enable.Checked = _settings.Enabled;
+            enable.Click += delegate { SetEnabled(enable.Checked); }; menu.Items.Add(enable);
             menu.Items.Add(new ToolStripSeparator());
-
-            ToolStripMenuItem enable = new ToolStripMenuItem("Enabled");
-            enable.Name = "enable";
-            enable.CheckOnClick = true;
-            enable.Checked = _settings != null && _settings.Enabled;
-            enable.Click += delegate { SetEnabled(enable.Checked); };
-            menu.Items.Add(enable);
-
-            menu.Items.Add(new ToolStripSeparator());
-
-            ToolStripMenuItem settingsItem = new ToolStripMenuItem("Settings...");
-            settingsItem.Name = "settings";
-            settingsItem.Click += delegate { ShowSettings(); };
-            menu.Items.Add(settingsItem);
-
-            ToolStripMenuItem downloadItem = new ToolStripMenuItem("Download speech model...");
-            downloadItem.Name = "download";
-            downloadItem.Click += delegate { DownloadModel(); };
-            menu.Items.Add(downloadItem);
-
+            ToolStripMenuItem preferences = new ToolStripMenuItem("Settings\u2026");
+            preferences.Click += delegate { ShowSettings(false); }; menu.Items.Add(preferences);
+            ToolStripMenuItem models = new ToolStripMenuItem("Choose speech model\u2026");
+            models.Click += delegate { ShowSettings(true); }; menu.Items.Add(models);
             ToolStripMenuItem copy = new ToolStripMenuItem("Copy last transcript");
-            copy.Click += delegate { ShowLastText(); };
-            menu.Items.Add(copy);
-
+            copy.Click += delegate { CopyLastText(); }; menu.Items.Add(copy);
             menu.Items.Add(new ToolStripSeparator());
-
-            ToolStripMenuItem quit = new ToolStripMenuItem("Quit");
-            quit.Click += delegate { Quit(); };
-            menu.Items.Add(quit);
-
+            ToolStripMenuItem quit = new ToolStripMenuItem("Quit Ukti");
+            quit.Click += delegate { Quit(); }; menu.Items.Add(quit);
             return menu;
         }
-
-        void SetStatusItem(string text)
+        void RefreshHotkey()
         {
-            if (_tray.ContextMenuStrip == null) return;
-            ToolStripItem item = _tray.ContextMenuStrip.Items["status"];
-            if (item != null) item.Text = text;
+            bool ready = _asr != null && _mic != null && (_state == AppState.Idle || _state == AppState.Recording);
+            bool sleeping = _state == AppState.Sleeping && !string.IsNullOrEmpty(_loadedModelPath);
+            bool waking = _state == AppState.Waking && _wakeHeld && !_wakeCancelled;
+            _hotkey.Enabled = !_exiting && _settings.Enabled && _settingsForm == null && (ready || sleeping || waking);
         }
-
         void SetState(AppState state, string tooltip)
         {
+            if (_exiting) return;
             _state = state;
-            if (_tray == null) return;
-
-            _tray.Text = Truncate(tooltip);
-            _tray.Icon = BuildTrayIcon(state);
-            SetStatusItem(tooltip);
+            _tray.Text = tooltip.Length > 63 ? tooltip.Substring(0, 60) + "\u2026" : tooltip;
+            _tray.ContextMenuStrip.Items["status"].Text = tooltip;
+            _tray.Icon = BuildTrayIcon(state, _settings.Enabled);
+            RefreshHotkey();
         }
-
-        static Icon _idleIcon, _recordIcon, _workIcon, _errorIcon;
-
-        static Icon BuildTrayIcon(AppState state)
+        static Icon _idleIcon, _pausedIcon, _recordIcon, _workIcon, _errorIcon;
+        [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr icon);
+        static Icon BuildTrayIcon(AppState state, bool enabled)
         {
-            Icon cached = state == AppState.Recording ? _recordIcon
-                        : state == AppState.Working ? _workIcon
-                        : state == AppState.Faulted ? _errorIcon
-                        : _idleIcon;
+            bool paused = !enabled && (state == AppState.Idle || state == AppState.Sleeping);
+            Icon cached = paused ? _pausedIcon : state == AppState.Recording ? _recordIcon :
+                state == AppState.Working ? _workIcon : state == AppState.Faulted ? _errorIcon : _idleIcon;
             if (cached != null) return cached;
-
-            // The mark takes the state colour, so one glyph reads as four
-            // states without four separate assets.
-            Color color = state == AppState.Recording ? Theme.Danger
-                        : state == AppState.Working ? Color.FromArgb(120, 170, 245)
-                        : state == AppState.Faulted ? Theme.WarmMic
-                        : Theme.TextBase;
-
-            Bitmap bmp = Theme.RenderMark(32, color);
-            Icon icon = Icon.FromHandle(bmp.GetHicon());
-            bmp.Dispose();
-
-            if (state == AppState.Recording) _recordIcon = icon;
-            else if (state == AppState.Working) _workIcon = icon;
-            else if (state == AppState.Faulted) _errorIcon = icon;
-            else _idleIcon = icon;
-            return icon;
+            Color color = paused ? Theme.FaintInk : state == AppState.Recording ? Theme.Danger :
+                state == AppState.Working ? Theme.AgentBlue : state == AppState.Faulted ? Theme.WarmMic : Theme.Ink;
+            Icon result;
+            using (Bitmap bitmap = Theme.RenderMark(32, color))
+            {
+                IntPtr handle = bitmap.GetHicon();
+                try { using (Icon icon = Icon.FromHandle(handle)) result = (Icon)icon.Clone(); }
+                finally { DestroyIcon(handle); }
+            }
+            if (paused) _pausedIcon = result;
+            else if (state == AppState.Recording) _recordIcon = result;
+            else if (state == AppState.Working) _workIcon = result;
+            else if (state == AppState.Faulted) _errorIcon = result;
+            else _idleIcon = result;
+            return result;
         }
-
-        void LoadModel()
+        void CloseMicrophone()
         {
-            Stopwatch sw = Stopwatch.StartNew();
+            if (_mic == null) return;
+            _mic.Dispose();
+            _mic = null;
+        }
+        void EnsureMicrophone()
+        {
+            if (!_settings.Enabled || _mic != null || _asr == null) return;
+            AudioCapture mic = new AudioCapture();
+            try { mic.DeviceIndex = _settings.MicrophoneIndex; mic.Open(); _mic = mic; }
+            catch { mic.Dispose(); throw; }
+        }
+        void SetReady()
+        {
+            if (_exiting) return;
+            if (_state == AppState.Unloading) { RefreshHotkey(); return; }
+            _idleClock.Restart();
+            if (_asr == null)
+            {
+                if (_state == AppState.Sleeping) SetSleepingReady();
+                else SetState(AppState.Faulted, "Speech engine unavailable - open Settings");
+                return;
+            }
+            if (!_settings.Enabled)
+            {
+                _hotkey.Dispose(); CloseMicrophone();
+                SetState(AppState.Idle, "Paused - dictation is off");
+                return;
+            }
             try
             {
-                if (!File.Exists(_modelPath))
+                // Mic stays open while idle; opening it can block for a while,
+                // which is safe now that Raw Input has no hook-thread timeout.
+                EnsureMicrophone();
+                if (!_hotkey.Install(_dispatcher.Handle)) throw new InvalidOperationException("Could not install the dictation shortcut.");
+                SetState(AppState.Idle, _settings.Enabled ? "Ready - hold " + HotkeyText + " to dictate" : "Paused - dictation is off");
+            }
+            catch (Exception ex)
+            {
+                CloseMicrophone();
+                SetState(AppState.Faulted, "Input unavailable - open Settings");
+                Notify("Could not enable dictation. " + ex.Message, ToolTipIcon.Warning);
+            }
+        }
+        void SetSleepingReady()
+        {
+            if (_exiting) return;
+            CloseMicrophone();
+            if (!_settings.Enabled) _hotkey.Dispose();
+            else if (!_hotkey.Install(_dispatcher.Handle))
+            { SetState(AppState.Faulted, "Could not install the wake shortcut"); return; }
+            SetState(AppState.Sleeping, _settings.Enabled ? "Model unloaded - hold " + HotkeyText + " to wake" : "Paused - model unloaded");
+        }
+        internal bool TryUnloadIdleModel(TimeSpan idle)
+        {
+            if (_exiting || (_state != AppState.Idle && _state != AppState.Faulted) || _asr == null || _pasteTimer != null ||
+                string.IsNullOrEmpty(_loadedModelPath) || !IdleUnloadPolicy.IsDue(_settings.IdleUnloadMinutes, idle)) return false;
+            IAsrEngine resident = _asr;
+            _asr = null;
+            SetState(AppState.Unloading, "Releasing model memory\u2026");
+            CloseMicrophone();
+            _work.Submit(delegate (CancellationToken token)
+            {
+                string error = null;
+                try { lock (_inferGate) resident.Dispose(); Memory.Trim(); }
+                catch (Exception ex) { error = ex.Message; }
+                return error;
+            }, delegate (object result, bool cancelled)
+            {
+                string error = result as string;
+                if (error == null) { SetSleepingReady(); Log("model unloaded after inactivity"); }
+                else { SetState(AppState.Faulted, "Could not release model memory"); Notify(error, ToolTipIcon.Warning); }
+                SpeechModel pending = _pendingModel;
+                string path = _pendingModelPath;
+                _pendingModel = null; _pendingModelPath = null;
+                if (pending != null) StartModelLoad(pending, path, false);
+            }, delegate { resident.Dispose(); });
+            return true;
+        }
+        void WakeForRecording()
+        {
+            _targetIdentity = new TargetIdentity(TextInjector.CurrentForegroundWindow());
+            _targetWindow = _targetIdentity.Window;
+            _wakeHeld = true; _wakeCancelled = false; _wakeSamples = null;
+            _captureVersion++;
+            SpeechModel model = ModelCatalog.Find(_settings.ModelId);
+            string path = _loadedModelPath;
+            int microphoneIndex = _settings.MicrophoneIndex;
+            SetState(AppState.Waking, "Waking model - wait for Listening before speaking");
+            _pill.ShowWorking(_targetWindow, "Waking");
+            _wakeToken = _work.Submit(delegate (CancellationToken token)
+            {
+                AudioCapture microphone = new AudioCapture();
+                try { microphone.DeviceIndex = microphoneIndex; microphone.Open(); }
+                catch (Exception ex)
                 {
-                    // A missing model is the normal first-run state, not an
-                    // error: fetch it here so the user never has to hunt for a
-                    // file or a download link.
-                    BeginOnUi(delegate
-                    {
-                        SetState(AppState.Loading, "Waiting for the speech model...");
-                        using (ModelSetupForm setup = new ModelSetupForm(_modelPath))
-                        {
-                            if (setup.ShowDialog() == DialogResult.OK)
-                            {
-                                // Model is in place; retry the load.
-                                Thread again = new Thread(LoadModel);
-                                again.IsBackground = true;
-                                again.SetApartmentState(ApartmentState.STA);
-                                again.Start();
-                            }
-                            else
-                            {
-                                SetState(AppState.Faulted, "No speech model - open Settings to try again");
-                            }
-                        }
-                    });
+                    microphone.Dispose();
+                    return new object[] { null, null, ex.Message };
+                }
+                if (token.IsCancellationRequested) { microphone.Dispose(); return new object[] { null, null, null }; }
+                IAsrEngine loaded = null;
+                string error = null;
+                try { lock (_inferGate) loaded = CreateRecognizer(model, path, token); }
+                catch (Exception ex) { error = ex.Message; }
+                return new object[] { microphone, loaded, error };
+            }, delegate (object state, bool cancelled)
+            {
+                _wakeToken = null;
+                if (cancelled || _exiting)
+                {
+                    DisposeWakeResult(state);
+                    _wakeHeld = false; _wakeCancelled = true; _wakeSamples = null;
+                    if (!_exiting) { _pill.HidePill(); SetSleepingReady(); }
                     return;
                 }
-
-                NemoAsr asr = NemoAsr.Create(_modelPath, 0, 0.16f, 1);
-
-                // First inference compiles GPU shaders (several seconds). Do it now
-                // so the user's first dictation is not the one that pays for it.
-                float[] warm = new float[AudioCapture.SampleRate / 2];
-                asr.Transcribe(warm, AudioCapture.SampleRate);
-
-                _asr = asr;
-                sw.Stop();
-                Log("model loaded in " + sw.ElapsedMilliseconds + " ms from " + _modelPath);
-
-                // Keep the microphone warm: opening it costs ~0.5 s, which would
-                // otherwise clip the start of every dictation.
-                AudioCapture mic = new AudioCapture();
-                mic.DeviceIndex = _settings.MicrophoneIndex;
-                mic.Open();
-                _mic = mic;
-                Log("microphone open: " + MicName());
-
-                BeginOnUi(delegate
+                object[] result = state as object[];
+                if (result == null) { FinishWake(null, WorkError(state)); return; }
+                AudioCapture microphone = (AudioCapture)result[0];
+                IAsrEngine recognizer = (IAsrEngine)result[1];
+                string error = cancelled ? null : (string)result[2];
+                if (microphone != null)
                 {
-                    if (!_hotkey.Install())
+                    if (cancelled || _state != AppState.Waking || !_settings.Enabled) microphone.Dispose();
+                    else
                     {
-                        Log("keyboard hook FAILED");
-                        SetState(AppState.Faulted, "Could not install the " + HotkeyText + " shortcut");
-                        _tray.ShowBalloonTip(8000, "Ukti",
-                            "Could not install the keyboard hook needed for hold-to-talk.",
-                            ToolTipIcon.Error);
-                        return;
+                        _mic = microphone;
+                        if (_wakeHeld && !_wakeCancelled)
+                        {
+                            try { _mic.BeginCapture(); _pill.ShowListening(_targetWindow); }
+                            catch (Exception ex)
+                            {
+                                _wakeHeld = false; _wakeCancelled = true;
+                                CloseMicrophone(); _pill.HidePill(); RefreshHotkey(); Notify(ex.Message, ToolTipIcon.Warning);
+                            }
+                        }
                     }
-                    Log("keyboard hook installed");
-
-                    // Keep Windows registration in sync with the saved setting;
-                    // the executable may have moved since it was set.
-                    if (_settings.RunAtStartup) Startup.Apply(true);
-
-                    SetState(AppState.Idle, _settings.Enabled
-                        ? "Ready - hold " + HotkeyText + " to dictate (" + sw.ElapsedMilliseconds + " ms load)"
-                        : "Turned off");
-
-                    // On first launch, or whenever the app is opened from the
-                    // Start menu rather than Windows sign-in, take the user to the
-                    // choices that matter instead of leaving them to find a tray
-                    // menu. A sign-in launch stays out of the way.
-                    if (!_settings.FirstRunDone)
-                    {
-                        _settings.FirstRunDone = true;
-                        _settings.Save();
-                        ShowSettings();
-                    }
-                    else if (!_startInBackground)
-                    {
-                        ShowSettings();
-                    }
-
-                    // Loading and warming the model touches far more memory than
-                    // sits in the tray afterwards, so give those pages back once
-                    // the first-run window is out of the way.
-                    StartIdleTrim();
-                });
-            }
-            catch (Exception ex)
-            {
-                Fail("Could not start the speech engine.\n\n" + ex.Message);
-            }
+                }
+                else if (error != null)
+                {
+                    _wakeHeld = false; _wakeCancelled = true;
+                    _pill.HidePill(); SetSleepingReady(); Notify("Could not open the microphone. " + error, ToolTipIcon.Warning);
+                }
+                if (recognizer != null)
+                {
+                    if (cancelled) recognizer.Dispose();
+                    else FinishWake(recognizer, error);
+                }
+                else if (error != null) FinishWake(null, error);
+            }, DisposeWakeResult);
         }
-
-        void Fail(string message)
+        void FinishWake(IAsrEngine recognizer, string error)
         {
-            Log("FAILED: " + message.Replace('\n', ' '));
+            if (_state != AppState.Waking) { if (recognizer != null) recognizer.Dispose(); return; }
+            if (error != null)
+            {
+                try { if (_mic != null) _mic.EndCapture(); } catch { }
+                _wakeHeld = false; _wakeCancelled = true; _wakeSamples = null;
+                CloseMicrophone(); _pill.HidePill();
+                SetState(AppState.Faulted, "Could not wake model - open Settings");
+                Notify("Could not reload the model. " + error, ToolTipIcon.Error);
+                return;
+            }
+            _asr = recognizer;
+            _idleClock.Restart();
+            // Capture starts as soon as the mic is ready, while weights warm on
+            // the worker. Audio spoken after Listening is never lost to reload.
+            if (_wakeHeld && !_wakeCancelled && _settings.Enabled && _mic != null)
+            { SetState(AppState.Recording, "Listening - release " + HotkeyText + " to insert"); return; }
+            float[] samples = _wakeSamples;
+            _wakeSamples = null;
+            if (!_wakeCancelled && _settings.Enabled && samples != null) TranscribeSamples(samples);
+            else { _pill.HidePill(); SetReady(); }
+        }
+        static string WorkError(object state)
+        { return state is Exception ? ((Exception)state).Message : "The speech operation did not return a result."; }
+        static void DisposeWakeResult(object state)
+        {
+            object[] result = state as object[];
+            if (result == null) return;
+            if (result[0] is IDisposable) ((IDisposable)result[0]).Dispose();
+            if (result[1] is IDisposable) ((IDisposable)result[1]).Dispose();
+        }
+        static void DisposeLoadResult(object state)
+        {
+            object[] result = state as object[];
+            if (result != null && result[0] is IDisposable) ((IDisposable)result[0]).Dispose();
+        }
+        static IAsrEngine CreateRecognizer(SpeechModel model, string path, CancellationToken cancel)
+        {
+            IAsrEngine engine = AsrBackend.Create(model, path, cancel);
+            try
+            {
+                using (cancel.Register(engine.Dispose))
+                {
+                    cancel.ThrowIfCancellationRequested();
+                    engine.Transcribe(new float[AudioCapture.SampleRate / 2], AudioCapture.SampleRate);
+                    cancel.ThrowIfCancellationRequested();
+                }
+                return engine;
+            }
+            catch { engine.Dispose(); throw; }
+        }
+        void StartModelLoad(SpeechModel model, string path, bool showPreferences)
+        {
+            if (_exiting || _state == AppState.Recording || _state == AppState.Working || _state == AppState.Waking) return;
+            if (_state == AppState.Unloading) { _pendingModel = model; _pendingModelPath = path; return; }
+            SetState(AppState.Loading, "Loading " + model.Name + "\u2026");
+            // Never overlap two multi-GB native workers during a model switch.
+            // Keep the old model's path so a failed replacement can wake it.
+            IAsrEngine previous = _asr;
             _asr = null;
-            BeginOnUi(delegate
+            _hotkey.Dispose();
+            CloseMicrophone();
+            _work.Submit(delegate (CancellationToken token)
             {
-                SetState(AppState.Faulted, "Speech engine unavailable - click for details");
-                _tray.ShowBalloonTip(8000, "Ukti", message, ToolTipIcon.Error);
-            });
-        }
-
-        // Turning the app off must actually stop it listening, not just grey out
-        // an icon, so the master switch gates the shortcut itself.
-        void SetEnabled(bool enabled)
-        {
-            _settings.Enabled = enabled;
-            _settings.Save();
-
-            ToolStripItem item = _tray.ContextMenuStrip.Items["enable"];
-            if (item is ToolStripMenuItem) ((ToolStripMenuItem)item).Checked = enabled;
-
-            if (!enabled && _state == AppState.Recording)
-            {
-                if (_mic != null) _mic.EndCapture();
-                _pill.HidePill();
-            }
-
-            SetState(AppState.Idle,
-                     enabled ? "Ready - hold " + HotkeyText + " to dictate" : "Turned off");
-        }
-
-        string MicName()
-        {
-            return _settings.MicrophoneIndex < 0
-                ? AudioCapture.DefaultDeviceName() + " (default)"
-                : AudioCapture.DeviceName(_settings.MicrophoneIndex);
-        }
-
-        // Changing the device reopens the capture stream; the app keeps the mic
-        // open for latency, so it has to be swapped rather than reconfigured.
-        void ShowSettings()
-        {
-            using (SettingsForm form = new SettingsForm(_settings))
-            {
-                if (form.ShowDialog() != DialogResult.OK) return;
-
-                int previousMic = _settings.MicrophoneIndex;
-
-                _settings.MicrophoneIndex = form.SelectedIndex;
-                _settings.Enabled = form.EnabledNow;
-                _settings.RunAtStartup = form.StartWithWindows;
-                _settings.RunInBackground = form.KeepRunning;
-                _settings.FirstRunDone = true;
-                _settings.Save();
-
-                if (!Startup.Apply(_settings.RunAtStartup))
-                {
-                    _tray.ShowBalloonTip(7000, "Ukti",
-                        "Could not change the Windows startup entry.", ToolTipIcon.Warning);
-                }
-
-                SetEnabled(_settings.Enabled);
-
-                if (_settings.MicrophoneIndex != previousMic)
-                {
-                    try
-                    {
-                        if (_mic != null) { _mic.Close(); _mic.Dispose(); _mic = null; }
-                        AudioCapture mic = new AudioCapture();
-                        mic.DeviceIndex = _settings.MicrophoneIndex;
-                        mic.Open();
-                        _mic = mic;
-                        Log("microphone switched to " + MicName());
-                    }
-                    catch (Exception ex)
-                    {
-                        Log("microphone switch failed: " + ex.Message);
-                        _tray.ShowBalloonTip(7000, "Ukti",
-                            "Could not open that microphone: " + ex.Message, ToolTipIcon.Warning);
-                    }
-                }
-            }
-        }
-
-        // Gives memory back after a quiet period, and again after each dictation
-        // settles. The delay matters: trimming right after a session would page
-        // the model back out just as the user is likely to speak again.
-        void StartIdleTrim()
-        {
-            if (_trimTimer != null) return;
-
-            _trimTimer = new System.Windows.Forms.Timer();
-            _trimTimer.Interval = 20000;
-            _trimTimer.Tick += delegate
-            {
-                if (_state != AppState.Idle) return;
-                long before = Memory.WorkingSetMb();
-                Memory.Trim();
-                long after = Memory.WorkingSetMb();
-                if (before > 0 && after > 0 && before - after > 24)
-                    Log("trimmed working set " + before + " MB -> " + after + " MB");
-            };
-            _trimTimer.Start();
-        }
-
-        void DownloadModel()
-        {
-            if (File.Exists(_modelPath))
-            {
-                _tray.ShowBalloonTip(4000, "Ukti",
-                    "The speech model is already installed.", ToolTipIcon.Info);
-                return;
-            }
-
-            using (ModelSetupForm setup = new ModelSetupForm(_modelPath))
-            {
-                if (setup.ShowDialog() != DialogResult.OK) return;
-            }
-
-            Thread again = new Thread(LoadModel);
-            again.IsBackground = true;
-            again.SetApartmentState(ApartmentState.STA);
-            again.Start();
-        }
-
-        void BeginOnUi(MethodInvoker action)
-        {
-            if (_dispatcher.InvokeRequired)
-                _dispatcher.BeginInvoke(action);
-            else
-                action();
-        }
-
-        static readonly string LogPath = Path.Combine(Path.GetTempPath(), "Ukti.log");
-
-        internal static void Log(string message)
-        {
-            try
-            {
-                File.AppendAllText(LogPath,
-                    DateTime.Now.ToString("HH:mm:ss.fff") + "  " + message + Environment.NewLine);
-            }
-            catch { }
-        }
-
-        void OnHotkeyPressed()
-        {
-            if (_asr == null || !_settings.Enabled || _state != AppState.Idle) return;
-            BeginOnUi(delegate { StartRecording(); });
-        }
-
-        void OnHotkeyReleased()
-        {
-            if (_state != AppState.Recording) return;
-            BeginOnUi(delegate { StopAndTranscribe(); });
-        }
-
-        void OnHotkeyCancelled()
-        {
-            if (_state != AppState.Recording) return;
-            BeginOnUi(delegate
-            {
-                if (_mic != null) _mic.EndCapture();
-                _pill.HidePill();
-                SetState(AppState.Idle, "Ready - hold " + HotkeyText + " to dictate");
-                PlayCue(true);
-            });
-        }
-
-        void StartRecording()
-        {
-            try
-            {
-                _targetWindow = TextInjector.CurrentForegroundWindow();
-                _since.Restart();
-
-                _mic.BeginCapture();
-
-                _pill.ShowListening(_targetWindow);
-                SetState(AppState.Recording, "Listening... release " + HotkeyText + " to insert");
-            }
-            catch (Exception ex)
-            {
-                Log("start FAILED: " + ex.Message);
-                _pill.HidePill();
-                SetState(AppState.Idle, "Ready - hold " + HotkeyText + " to dictate");
-                _tray.ShowBalloonTip(7000, "Ukti", ex.Message, ToolTipIcon.Warning);
-            }
-        }
-
-        void StopAndTranscribe()
-        {
-            _since.Stop();
-            long heldMs = _since.ElapsedMilliseconds;
-
-            float[] samples;
-            try
-            {
-                samples = _mic.EndCapture();
-            }
-            catch (Exception ex)
-            {
-                _pill.HidePill();
-                SetState(AppState.Idle, "Ready - hold " + HotkeyText + " to dictate");
-                _tray.ShowBalloonTip(7000, "Ukti", "Recording stopped: " + ex.Message, ToolTipIcon.Warning);
-                return;
-            }
-
-            double peak = 0, sumSquares = 0;
-            for (int i = 0; i < samples.Length; i++)
-            {
-                double a = Math.Abs(samples[i]);
-                if (a > peak) peak = a;
-                sumSquares += samples[i] * samples[i];
-            }
-            double rms = samples.Length > 0 ? Math.Sqrt(sumSquares / samples.Length) : 0;
-
-            Log("captured " + samples.Length + " samples (" + (samples.Length / 16.0).ToString("0") +
-                " ms, held " + heldMs + " ms) peak=" + peak.ToString("0.0000") +
-                " rms=" + rms.ToString("0.00000"));
-
-            if (samples.Length < AudioCapture.SampleRate / 4)
-            {
-                Log("too short, ignored");
-                _pill.HidePill();
-                SetState(AppState.Idle, "Ready - hold " + HotkeyText + " to dictate");
-                return;
-            }
-
-            if (peak < 0.002)
-            {
-                Log("input was silent, skipping inference");
-                _pill.HidePill();
-                SetState(AppState.Idle, "Ready - hold " + HotkeyText + " to dictate");
-                _tray.ShowBalloonTip(6000, "Ukti",
-                    "No sound reached the microphone. Check the input device and its level.",
-                    ToolTipIcon.Info);
-                return;
-            }
-
-            _pill.ShowWorking(_targetWindow, "Processing");
-            SetState(AppState.Working, "Transcribing...");
-
-            Thread worker = new Thread(delegate ()
-            {
-                string text = null;
+                IAsrEngine replacement = null;
                 string error = null;
-                long inferMs = 0;
-                Stopwatch sw = Stopwatch.StartNew();
+                Stopwatch clock = Stopwatch.StartNew();
                 try
                 {
                     lock (_inferGate)
                     {
-                        // Prepare builds a conditioned copy, so the raw capture is
-                        // dropped as soon as it is no longer needed: on a long
-                        // dictation this is tens of megabytes of float audio that
-                        // would otherwise sit alive until the next session.
-                        float[] prepared = AudioPipeline.Prepare(samples, AudioCapture.SampleRate);
-                        samples = null;
-
-                        text = _asr.Transcribe(prepared, AudioCapture.SampleRate);
-                        prepared = null;
+                        if (previous != null) previous.Dispose();
+                        replacement = CreateRecognizer(model, path, token);
                     }
                 }
-                catch (Exception ex)
+                catch (Exception ex) { error = ex.Message; if (replacement != null) replacement.Dispose(); replacement = null; }
+                return new object[] { replacement, error, clock.ElapsedMilliseconds };
+            }, delegate (object state, bool cancelled)
+            {
+                if (_exiting || cancelled)
                 {
-                    error = ex.Message;
-                }
-                finally
-                {
-                    samples = null;
-                }
-                sw.Stop();
-                inferMs = sw.ElapsedMilliseconds;
-                Log("infer " + inferMs + " ms error=" + error + " text=[" + (text ?? "") + "]");
-
-                BeginOnUi(delegate
-                {
-                    _pill.HidePill();
-                    SetState(AppState.Idle, "Ready - hold " + HotkeyText + " to dictate");
-
-                    if (error != null)
+                    DisposeLoadResult(state);
+                    if (!_exiting)
                     {
-                        _tray.ShowBalloonTip(8000, "Ukti", "Transcription failed: " + error, ToolTipIcon.Error);
-                        return;
+                        if (!string.IsNullOrEmpty(_loadedModelPath)) SetSleepingReady();
+                        else SetReady();
                     }
-
-                    text = (text ?? string.Empty).Trim();
-                    if (text.Length == 0) return;
-
-                    _lastText = text;
-
-                    string pasteError = TextInjector.Paste(text, _targetWindow);
-                    Log("paste=" + (pasteError ?? "ok") + " total=" + (heldMs + inferMs) + " ms");
-
-                    if (pasteError != null)
-                    {
-                        _tray.ShowBalloonTip(8000, "Ukti",
-                            pasteError + "\n\nThe text was copied, so you can paste it manually with Ctrl+V.",
-                            ToolTipIcon.Info);
-                    }
-                });
+                    return;
+                }
+                object[] result = state as object[];
+                if (result == null) { SetReady(); Notify(WorkError(state), ToolTipIcon.Error); return; }
+                IAsrEngine loaded = (IAsrEngine)result[0];
+                string error = (string)result[1];
+                if (result[0] != null && !cancelled)
+                {
+                    lock (_inferGate) { if (_asr != null) _asr.Dispose(); _asr = loaded; }
+                    _loadedModelPath = path;
+                    _settings.ModelId = model.Id;
+                    _settings.FirstRunDone = true;
+                    SaveSettings();
+                    Log("loaded " + model.Id + " in " + result[2] + " ms");
+                }
+                else if (loaded != null) loaded.Dispose();
+                if (_asr == null && !string.IsNullOrEmpty(_loadedModelPath)) SetSleepingReady();
+                else SetReady();
+                if (error != null)
+                    Notify("Could not load " + model.Name + ". " + error +
+                        (!string.IsNullOrEmpty(_loadedModelPath) ? " Your previous model remains selected; hold the shortcut to reload it." : " Choose a model in Settings."), ToolTipIcon.Error);
+                if (showPreferences) ShowSettings(false);
+            }, delegate(object state)
+            {
+                if (previous != null) previous.Dispose();
+                DisposeLoadResult(state);
             });
-            worker.IsBackground = true;
-            worker.Start();
         }
-
-        static string Truncate(string s)
+        void SetEnabled(bool enabled)
         {
-            if (s == null) return "";
-            return s.Length > 63 ? s.Substring(0, 60) + "..." : s;
+            _settings.Enabled = enabled;
+            SaveSettings();
+            ((ToolStripMenuItem)_tray.ContextMenuStrip.Items["enable"]).Checked = enabled;
+            if (!enabled)
+            {
+                CancelWork();
+                _captureVersion++;
+                // A released wake hold can still have buffered audio waiting for
+                // weights. Invalidate it explicitly, not only via an armed hook.
+                if (_state == AppState.Recording || _state == AppState.Waking) CancelRecording();
+                _hotkey.Enabled = false;
+                CloseMicrophone();
+            }
+            if (_state == AppState.Loading || _state == AppState.Working || _state == AppState.Unloading || _state == AppState.Waking)
+            { RefreshHotkey(); return; }
+            SetReady();
         }
-
-        static void PlayCue(bool start)
+        void ShowSettings(bool openModels)
         {
+            if (_exiting) return;
+            if (_settingsForm != null) { _settingsForm.Activate(); return; }
+            if (_state == AppState.Loading || _state == AppState.Working || _state == AppState.Unloading || _state == AppState.Waking)
+            { Notify("Finishing the current operation. Please open Settings in a moment.", ToolTipIcon.Info); return; }
+            if (_state == AppState.Recording) CancelRecording();
+            string proposedModel = _settings.ModelId;
+            bool accepted;
+            bool closeRequested;
+            using (SettingsForm form = new SettingsForm(_settings))
+            {
+                _settingsForm = form;
+                Shortcut shortcut = _settings.GetShortcut();
+                form.SuppressKey = delegate (Keys keyData)
+                {
+                    Keys key = keyData & Keys.KeyCode;
+                    Keys mods = keyData & (Keys.Control | Keys.Alt | Keys.Shift);
+                    return key == shortcut.Key && mods == shortcut.Modifiers;
+                };
+                form.EnableChanged += SetEnabled;
+                if (openModels) form.Shown += delegate { form.OpenModelLibrary(); };
+                accepted = form.ShowDialog() == DialogResult.OK;
+                closeRequested = form.WindowCloseRequested;
+                if (accepted)
+                {
+                    _settings.MicrophoneIndex = form.SelectedIndex;
+                    _settings.RunAtStartup = form.StartWithWindows;
+                    _settings.RunInBackground = form.KeepRunning;
+                    _settings.ShortcutText = form.ShortcutText;
+                    _settings.IdleUnloadMinutes = form.IdleUnloadMinutes;
+                    _settings.FirstRunDone = true;
+                    proposedModel = form.ModelId;
+                    _hotkey.Configure(_settings.GetShortcut());
+                    _tray.ContextMenuStrip.Items["shortcutHint"].Text = "Hold " + HotkeyText + " to dictate";
+                    SaveSettings();
+                    if (!Startup.Apply(_settings.RunAtStartup)) Notify("Could not update Windows startup registration.", ToolTipIcon.Warning);
+                    // Reopen even the same selection to recover an unplugged
+                    // endpoint or stopped capture stream when preferences save.
+                    CloseMicrophone();
+                }
+                _settingsForm = null;
+            }
+            if (_exiting) return;
+            if (closeRequested && !_settings.RunInBackground) { Quit(); return; }
+            if (accepted && (proposedModel != _settings.ModelId || (_asr == null && _state != AppState.Sleeping && _state != AppState.Unloading)))
+            {
+                SpeechModel model = ModelCatalog.Find(proposedModel);
+                string path = ModelCatalog.PathFor(model, ModelCatalog.DirectoryPath);
+                if (!ModelCatalog.IsInstalled(model, ModelCatalog.DirectoryPath))
+                { Notify("Download this model with Manage models before applying it.", ToolTipIcon.Warning); SetReady(); return; }
+                StartModelLoad(model, path, false);
+            }
+            else SetReady();
+        }
+        void StartRecording()
+        {
+            if (!_exiting && _settings.Enabled && _settingsForm == null && _state == AppState.Sleeping)
+            { WakeForRecording(); return; }
+            if (_exiting || _asr == null || _mic == null || !_settings.Enabled || _state != AppState.Idle || _settingsForm != null) return;
             try
             {
-                if (start) SystemSounds.Asterisk.Play();
-                else SystemSounds.Beep.Play();
+                _targetIdentity = new TargetIdentity(TextInjector.CurrentForegroundWindow());
+                _targetWindow = _targetIdentity.Window;
+                _mic.BeginCapture();
+                _pill.ShowListening(_targetWindow);
+                SetState(AppState.Recording, "Listening - release " + HotkeyText + " to insert");
             }
-            catch { }
+            catch (Exception ex) { _pill.HidePill(); SetReady(); Notify("Could not record. " + ex.Message, ToolTipIcon.Warning); }
         }
-
-        void ShowLastText()
+        void CancelRecording()
         {
-            if (string.IsNullOrEmpty(_lastText))
+            if (_state == AppState.Waking)
             {
-                _tray.ShowBalloonTip(4000, "Ukti", "Nothing has been dictated yet.", ToolTipIcon.Info);
+                if (_wakeCancelled) return;
+                _wakeHeld = false; _wakeCancelled = true; _wakeSamples = null;
+                CancelWork();
+                _captureVersion++;
+                try { if (_mic != null) _mic.EndCapture(); } catch (Exception ex) { Log("cancel wake: " + ex.Message); }
+                _pill.HidePill(); RefreshHotkey();
                 return;
             }
-
-            if (TextInjector.CopyToClipboard(_lastText))
-                _tray.ShowBalloonTip(4000, "Ukti", "Last transcript copied to the clipboard.", ToolTipIcon.Info);
+            if (_state != AppState.Recording) return;
+            CancelWork();
+            _captureVersion++;
+            try { if (_mic != null) _mic.EndCapture(); } catch (Exception ex) { Log("cancel: " + ex.Message); }
+            _pill.HidePill();
+            SetReady();
         }
+        void StopAndTranscribe()
+        {
+            if (_state == AppState.Waking)
+            {
+                _wakeHeld = false;
+                try { if (_mic != null && !_wakeCancelled) _wakeSamples = _mic.EndCapture(); }
+                catch (Exception ex) { _wakeCancelled = true; Notify(ex.Message, ToolTipIcon.Warning); }
+                if (_wakeSamples != null && !_wakeCancelled) _pill.ShowWorking(_targetWindow, "Waking");
+                else _pill.HidePill();
+                RefreshHotkey();
+                return;
+            }
+            if (_state != AppState.Recording || _mic == null || _exiting) return;
+            float[] samples;
+            try { samples = _mic.EndCapture(); }
+            catch (Exception ex) { _pill.HidePill(); SetReady(); Notify(ex.Message, ToolTipIcon.Warning); return; }
+            TranscribeSamples(samples);
+        }
+        void TranscribeSamples(float[] samples)
+        {
+            if (samples.Length < AudioCapture.SampleRate / 4) { _pill.HidePill(); SetReady(); return; }
+            double peak = 0;
+            foreach (float sample in samples) peak = Math.Max(peak, Math.Abs(sample));
+            if (peak < 0.002)
+            {
+                _pill.HidePill(); SetReady();
+                Notify("No sound reached the microphone. Check your input device and level.", ToolTipIcon.Info); return;
+            }
+            int version = ++_captureVersion;
+            IntPtr target = _targetWindow;
+            _pill.ShowWorking(target, "Processing");
+            SetState(AppState.Working, "Transcribing\u2026");
+            _transcribeToken = _work.Submit(delegate (CancellationToken cancel)
+            {
+                string text = null, error = null;
+                Stopwatch clock = Stopwatch.StartNew();
+                IAsrEngine engine = _asr;
+                try
+                {
+                    lock (_inferGate)
+                    {
+                        if (engine == null || cancel.IsCancellationRequested) return new object[] { null, null };
+                        float[] prepared = AudioPipeline.Prepare(samples, AudioCapture.SampleRate);
+                        text = StreamingPrototype.Transcribe(engine, prepared, AudioCapture.SampleRate, 2);
+                        if (text == null) text = engine.Transcribe(prepared, AudioCapture.SampleRate);
+                    }
+                }
+                catch (Exception ex) { error = ex.Message; }
+                finally { samples = null; }
+                Log("transcription " + clock.ElapsedMilliseconds + " ms" + (error != null ? ", failed" : ""));
+                return new object[] { text, error };
+            }, delegate (object state, bool cancelled)
+            {
+                _transcribeToken = null;
+                if (_exiting) return;
+                _pill.HidePill();
+                if (cancelled) { SetReady(); return; }
+                object[] result = state as object[];
+                if (result == null) { SetReady(); Notify(WorkError(state), ToolTipIcon.Error); return; }
+                string text = (string)result[0], error = (string)result[1];
+                if (error != null) { SetReady(); Notify("Transcription failed: " + error, ToolTipIcon.Error); return; }
+                text = (text ?? "").Trim();
+                if (text.Length == 0) { SetReady(); return; }
+                InsertAfterKeyRelease(text, target, version);
+            });
+        }
+        void CancelWork()
+        {
+            CancelToken(ref _wakeToken);
+            CancelToken(ref _transcribeToken);
+        }
+        static void CancelToken(ref CancellationTokenSource field)
+        {
+            CancellationTokenSource token = field;
+            field = null;
+            if (token != null) try { token.Cancel(); } catch (ObjectDisposedException) { }
+        }
+        internal bool CanPasteResult(int version)
+        { return !_exiting && _settings.Enabled && version == _captureVersion; }
+        void InsertAfterKeyRelease(string text, IntPtr target, int version)
+        {
+            if (TextInjector.ModifiersReleased()) { CommitText(text, target, version, false); return; }
+            SetState(AppState.Working, "Release the shortcut keys to insert");
+            Stopwatch wait = Stopwatch.StartNew();
+            _pasteTimer = new System.Windows.Forms.Timer();
+            _pasteTimer.Interval = 15;
+            _pasteTimer.Tick += delegate
+            {
+                if (!CanPasteResult(version))
+                {
+                    _pasteTimer.Dispose(); _pasteTimer = null; SetReady(); return;
+                }
+                bool released = TextInjector.ModifiersReleased();
+                if (!released && wait.ElapsedMilliseconds < 1500) return;
+                _pasteTimer.Dispose(); _pasteTimer = null;
+                CommitText(text, target, version, !released);
+            };
+            _pasteTimer.Start();
+        }
+        void CommitText(string text, IntPtr target, int version, bool clipboardOnly)
+        {
+            if (!CanPasteResult(version)) { SetReady(); return; }
+            // Retain every valid result, including clipboard-only fallbacks.
+            _lastText = text;
+            if (!clipboardOnly && _targetIdentity != null && !_targetIdentity.Matches(TextInjector.CurrentForegroundWindow()))
+            {
+                string copied = TextInjector.CopyToClipboard(text) ? "The target application changed. Your text was copied; paste it with Ctrl+V." :
+                    "The target application changed and the clipboard is unavailable. Use Copy last transcript from the tray to try again.";
+                SetReady(); Notify(copied, ToolTipIcon.Info); return;
+            }
+            string error;
+            if (clipboardOnly)
+                error = TextInjector.CopyToClipboard(text) ? "Shortcut keys are still held. Your text was copied; release them and paste with Ctrl+V." : "Could not access the clipboard. Use Copy last transcript from the tray to try again.";
+            else error = TextInjector.Paste(text, target);
+            SetReady();
+            if (error != null) Notify(error, ToolTipIcon.Info);
+        }
+        void CopyLastText()
+        {
+            if (_lastText.Length == 0) { Notify("Nothing has been dictated yet.", ToolTipIcon.Info); return; }
+            if (TextInjector.CopyToClipboard(_lastText)) Notify("Last transcript copied.", ToolTipIcon.Info);
+        }
+        void SaveSettings()
+        {
+            if (!_settings.Save()) Notify("Could not save preferences. Check that your Ukti app-data folder is writable. Changes may be lost on restart.", ToolTipIcon.Warning);
+        }
+        void Notify(string message, ToolTipIcon icon) { if (!_exiting) _tray.ShowBalloonTip(7000, "Ukti", message, icon); }
+        // Native resources own their lifetime via SafeHandle; callbacks are
+        // marshalled by WorkCoordinator.Post.
+        void Post(MethodInvoker action)
+        {
+            if (_exiting) return;
+            try { _dispatcher.BeginInvoke((MethodInvoker)delegate { if (!_exiting) action(); }); }
+            catch (InvalidOperationException) { }
+        }
+        internal static void Log(string message) { AppLogger.Info(message); }
+        internal static void LogError(string message) { AppLogger.Error(message); }
 
         void Quit()
         {
-            if (_mic != null) { _mic.Close(); _mic.Dispose(); _mic = null; }
-            if (_asr != null) { _asr.Dispose(); _asr = null; }
+            if (_exiting) return;
+            _exiting = true;
+            _captureVersion++;
             _hotkey.Dispose();
+
+            _idleTimer.Dispose();
+            _wakeSamples = null;
+            if (_pasteTimer != null) { _pasteTimer.Dispose(); _pasteTimer = null; }
+            if (_settingsForm != null) _settingsForm.Close();
+            CloseMicrophone();
+            CancelWork();
+            _work.CancelAll();
+            // Killing the isolated engine unblocks any in-flight pipe read;
+            // only then join workers. Do not wait on inference's lock here.
+            IAsrEngine resident = _asr;
+            _asr = null;
+            if (resident != null) resident.Dispose();
+            _work.Dispose();
+            _pill.HidePill();
             _pill.Dispose();
-
+            // Quit is clicked from the tray menu, so that menu is still open.
+            // Disposing the strip inside its own modal loop makes WinForms'
+            // ModalMenuFilter re-parent a disposed drop-down and throw.
+            // ExitThread ends the process; Windows reclaims the handles.
+            _tray.ContextMenuStrip.Close();
             _tray.Visible = false;
-            _tray.Dispose();
-
             ExitThread();
         }
     }
@@ -672,24 +733,21 @@ namespace Ukti
         [STAThread]
         static void Main(string[] args)
         {
-            // Launching the executable again while it is already running is how a
-            // user reopens the window from the Start menu, so the second process
-            // asks the running one to show its settings instead of erroring.
+            if (AsrWorker.IsWorker(args)) { Environment.ExitCode = AsrWorker.Run(args); return; }
             bool created;
             using (Mutex mutex = new Mutex(true, "Ukti.SingleInstance", out created))
             {
                 if (!created)
                 {
-                    if (Ipc.RequestShowWindow())
-                    {
-                        return;
-                    }
-
-                    MessageBox.Show("Ukti is already running. Look for the microphone icon in the tray.",
+                    if (!Ipc.RequestShowWindow()) MessageBox.Show("Ukti is already running. Open it from the system tray.",
                         "Ukti", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
-
+                CrashDumps.Enable();
+                Application.ThreadException += delegate (object sender, System.Threading.ThreadExceptionEventArgs e)
+                { CrashLog.Write(e.Exception); };
+                AppDomain.CurrentDomain.UnhandledException += delegate (object sender, UnhandledExceptionEventArgs e)
+                { CrashLog.Write(e.ExceptionObject as Exception); };
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new TrayApp(args.Length > 0 && args[0] == "--background"));

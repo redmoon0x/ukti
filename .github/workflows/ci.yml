@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build application
+        run: dotnet build Ukti.csproj -c Release -nologo
+      - name: Build regression tests
+        run: dotnet build tests/Ukti.Tests.csproj -c Release -nologo
+      - name: Unit and UI tests (no mic, GPU, model or network)
+        run: dotnet run --project tests/Ukti.Tests.csproj -c Release --no-build -- --ui
+      - name: Installer download-verification fixtures (no network)
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-runtime-bootstrap.ps1
+
+# GPU/model/interactive installer checks are opt-in local scripts, not jobs on
+# a hosted runner with no NVIDIA device or downloaded model:
+#   scripts/test-runtime.ps1
+#   scripts/test-interaction.ps1 -Speech
+#   scripts/test-installer.ps1 -RuntimeDirectory app -RuntimeTest
